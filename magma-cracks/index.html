@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magma Cracks</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2a1d12; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #f3d9b1;
+         font: 14px/1.4 system-ui, sans-serif; text-align: center; padding: 16px; }
+  #back { position: fixed; top: 14px; left: 16px; color: rgba(241,228,210,.55); text-decoration: none;
+          font: 13px/1 system-ui, sans-serif; letter-spacing: .02em; transition: color .15s; }
+  #back:hover, #back:focus-visible { color: rgba(241,228,210,.95); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="back" href="../">← Doodles</a>
+<div id="err">WebGL2 is required for this demo.</div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+#define MAX_PTS 96
+
+uniform vec2  uRes;        // framebuffer size (px)
+uniform vec3  uSq;         // square center (px, GL coords) + half size (px)
+uniform float uTime;
+uniform vec4  uPts[MAX_PTS];  // xy: square-local uv, z: life 0..1, w: radius
+uniform vec4  uVel[MAX_PTS];  // xy: elastic drag offset toward live cursor (uv)
+uniform int   uCount;
+
+out vec4 fragColor;
+
+// ---------- noise ----------
+vec2 hash2(vec2 p) {
+  p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+  return fract(sin(p) * 43758.5453);
+}
+float hash1(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash1(i), b = hash1(i + vec2(1, 0)), c = hash1(i + vec2(0, 1)), d = hash1(i + vec2(1, 1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = r * p * 2.03 + 11.7; a *= 0.5; }
+  return s;
+}
+
+// Distance to the nearest Voronoi border (IQ). Borders form a fully connected network.
+float voronoiEdge(vec2 x) {
+  vec2 n = floor(x), f = fract(x);
+  vec2 mg, mr; float md = 8.0;
+  for (int j = -1; j <= 1; j++)
+  for (int i = -1; i <= 1; i++) {
+    vec2 g = vec2(float(i), float(j));
+    vec2 o = 0.15 + 0.7 * hash2(n + g);
+    vec2 r = g + o - f;
+    float d = dot(r, r);
+    if (d < md) { md = d; mr = r; mg = g; }
+  }
+  md = 8.0;
+  for (int j = -2; j <= 2; j++)
+  for (int i = -2; i <= 2; i++) {
+    vec2 g = mg + vec2(float(i), float(j));
+    vec2 o = 0.15 + 0.7 * hash2(n + g);
+    vec2 r = g + o - f;
+    if (dot(mr - r, mr - r) > 1e-5)
+      md = min(md, dot(0.5 * (mr + r), normalize(r - mr)));
+  }
+  return md;
+}
+
+// ---------- mud ----------
+float mudHeight(vec2 p) {
+  float h = fbm(p * 2.2);
+  h += 0.35 * fbm(p * 7.0 + 3.1);
+  h += 0.10 * vnoise(p * 40.0);           // grit
+  return h;
+}
+
+vec3 mud(vec2 fragPx) {
+  float scale = 1.0 / min(uRes.x, uRes.y);
+  vec2 p = fragPx * scale * 3.0;
+  float e = 0.004;
+  float h  = mudHeight(p);
+  float hx = mudHeight(p + vec2(e, 0.0));
+  float hy = mudHeight(p + vec2(0.0, e));
+  vec3 n = normalize(vec3((h - hx) / e * 0.06, (h - hy) / e * 0.06, 1.0));
+
+  float tone = fbm(p * 0.9 + 7.0);
+  vec3 dark  = vec3(0.14, 0.095, 0.06);
+  vec3 mid   = vec3(0.30, 0.21, 0.12);
+  vec3 ochre = vec3(0.43, 0.32, 0.18);
+  vec3 col = mix(dark, mid, smoothstep(0.25, 0.65, h));
+  col = mix(col, ochre, smoothstep(0.55, 0.85, tone) * 0.55);
+
+  // wet puddles in low areas: darker, glossy
+  float wet = smoothstep(0.42, 0.30, h + 0.15 * (tone - 0.5));
+  col = mix(col, col * 0.55, wet);
+
+  vec3 L = normalize(vec3(-0.5, 0.6, 0.65));
+  float diff = clamp(dot(n, L), 0.0, 1.0);
+  col *= 0.55 + 0.6 * diff;
+  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+  float spec = pow(clamp(dot(n, H), 0.0, 1.0), mix(18.0, 90.0, wet));
+  col += vec3(0.85, 0.75, 0.6) * spec * mix(0.04, 0.35, wet);
+
+  // pebbles
+  float peb = smoothstep(0.86, 0.9, vnoise(p * 22.0 + 5.0)) * smoothstep(0.4, 0.7, h);
+  col = mix(col, vec3(0.38, 0.33, 0.27) * (0.6 + 0.6 * diff), peb * 0.6);
+
+  // vignette
+  vec2 q = fragPx / uRes - 0.5;
+  col *= 1.0 - 0.55 * dot(q, q) * 1.6;
+  return col;
+}
+
+// ---------- magma ramp: hot core -> dark margin ----------
+vec3 magmaRamp(float t, float heat) {
+  // t: 0 = crack center, 1 = crack margin
+  vec3 core   = vec3(1.00, 0.93, 0.62);
+  vec3 yellow = vec3(1.00, 0.68, 0.16);
+  vec3 orange = vec3(0.95, 0.32, 0.03);
+  vec3 red    = vec3(0.50, 0.05, 0.01);
+  vec3 edge   = vec3(0.10, 0.01, 0.00);
+  // cooling shifts the whole ramp toward the margin colours
+  t = clamp(t + (1.0 - heat) * 0.55, 0.0, 1.0);
+  vec3 c = mix(core, yellow, smoothstep(0.00, 0.22, t));
+  c = mix(c, orange, smoothstep(0.18, 0.48, t));
+  c = mix(c, red,    smoothstep(0.45, 0.78, t));
+  c = mix(c, edge,   smoothstep(0.72, 1.00, t));
+  return c;
+}
+
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+
+  // square-local coordinates (0..1), y up
+  vec2 lp = (frag - (uSq.xy - uSq.z)) / (2.0 * uSq.z);
+  float px = 1.0 / (2.0 * uSq.z);   // one pixel in uv
+  vec2 dq = abs(lp - 0.5) - 0.5;
+  float sd = length(max(dq, 0.0)) + min(max(dq.x, dq.y), 0.0); // signed dist to square (uv)
+  float inside = 1.0 - smoothstep(-px, px, sd);
+
+  // mud only where it is visible (outside + anti-aliased edge)
+  vec3 col = vec3(0.0);
+  if (inside < 1.0) {
+    col = mud(frag);
+    col *= mix(0.45, 1.0, smoothstep(0.0, 0.06, sd));  // soft contact shadow of the slab
+  }
+  if (inside <= 0.0) { fragColor = vec4(pow(col, vec3(0.92)), 1.0); return; }
+
+  // ---------- influence field from cursor trail ----------
+  float keep = 1.0;          // product of (1 - contribution)  -> soft union
+  vec2  push = vec2(0.0);    // outward push (weighted average)
+  vec2  drag = vec2(0.0);    // follow-the-cursor drag (weighted average)
+  float wsum = 0.0;
+  float wob = vnoise(lp * 7.0 + uTime * 0.25) - 0.5;
+  for (int i = 0; i < MAX_PTS; i++) {
+    if (i >= uCount) break;
+    vec4 P = uPts[i];
+    if (P.z <= 0.001) continue;
+    vec2 d = lp - P.xy;
+    float dist = length(d) * (1.0 + 0.45 * wob);
+    float f = smoothstep(P.w, 0.0, dist);
+    f = f * f * (3.0 - 2.0 * f);
+    float c = P.z * f;
+    keep *= 1.0 - c;
+    push += (d / (length(d) + 0.03)) * c;   // pattern expands away from the point
+    drag += uVel[i].xy * c;                  // pattern is pulled toward the live cursor
+    wsum += c;
+  }
+  float I = 1.0 - keep;
+  // normalised so stacking points (resting cursor) doesn't over-inflate the warp
+  vec2 disp = (push * 0.07 + drag) / max(wsum, 1.0) * I;
+  // keep the slab's border intact
+  float border = smoothstep(0.0, 0.045, -sd);
+  I *= border;
+
+  vec3 slab = vec3(0.0);
+  if (I > 0.002) {
+    // organic slow creep + warp
+    vec2 q = lp - disp;
+    q += 0.018 * vec2(fbm(q * 5.0 + 1.7), fbm(q * 5.0 - 4.3)) * I;
+
+    // main connected crack network (jagged via domain warp)
+    float S1 = 5.0;
+    vec2 q1 = q * S1 + 0.55 * vec2(fbm(q * 9.0), fbm(q * 9.0 + 5.2)) - 0.27;
+    float e1 = voronoiEdge(q1) / S1;
+
+    // secondary finer branches, only where pressure is high
+    float S2 = 11.0;
+    vec2 q2 = q * S2 + 0.7 * vec2(fbm(q * 14.0 + 2.0), fbm(q * 14.0 + 8.0)) + 3.3;
+    float e2 = voronoiEdge(q2) / S2;
+
+    // width varies along the crack for an organic, uneven look
+    float wv = 0.55 + 0.9 * vnoise(q * 18.0);
+    float w1 = I * I * 0.020 * wv + I * 0.002;
+    float w2 = smoothstep(0.45, 1.0, I) * 0.008 * wv;
+
+    float t1 = e1 / max(w1, 1e-5);
+    float t2 = e2 / max(w2, 1e-5);
+    float t  = min(t1, w2 > 1e-4 ? t2 : 9.0);
+    float w  = t1 < t2 ? w1 : w2;
+
+    float heat = smoothstep(0.05, 0.75, I);
+    // flowing magma inside the crack
+    float flow = fbm(q * 40.0 + vec2(uTime * 0.35, -uTime * 0.6));
+
+    // sub-pixel cracks: evaluate at >= ~1px width, then fade by true coverage (no speckles while healing)
+    float wE = max(w, px * 0.9);
+    float tE = t * w / wE;
+    float aa = px / wE;
+    float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, tE)) * clamp(w / (px * 0.9), 0.0, 1.0);
+    vec3 lava = magmaRamp(min(tE, 1.0), heat) * (0.75 + 0.5 * flow);
+
+    // heat bleeding into the black rock beside the crack
+    float gd = max(min(e1 - w1, w2 > 1e-4 ? e2 - w2 : 9.0), 0.0);
+    // kept at/below the dark margin colour so the crack edge stays the darkest band of the lava
+    float glow = exp(-gd / (0.004 + 0.008 * I)) * I * I;
+    vec3 rock = vec3(0.09, 0.009, 0.0) * glow;
+
+    slab = mix(rock, lava, m);
+  }
+
+  col = mix(col, slab, inside);
+  fragColor = vec4(pow(col, vec3(0.92)), 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const MAX_PTS = 96;   // 2 x 96 vec4 uniforms, under WebGL2's guaranteed 224
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+  if (!gl) { document.getElementById('err').style.display = 'grid'; return; }
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src.trim());
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {};
+  for (const n of ['uRes', 'uSq', 'uTime', 'uPts', 'uVel', 'uCount']) U[n] = gl.getUniformLocation(prog, n);
+
+  // ---------- layout ----------
+  let dpr = 1, W = 0, H = 0, sq = { cx: 0, cy: 0, half: 0 };   // sq in CSS px, y down
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    sq.half = Math.min(W, H) * 0.27;
+    sq.cx = W / 2; sq.cy = H / 2;
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // CSS px -> square-local uv (0..1, y up)
+  const toLocal = (x, y) => [
+    (x - (sq.cx - sq.half)) / (2 * sq.half),
+    1 - (y - (sq.cy - sq.half)) / (2 * sq.half),
+  ];
+  const isInside = (u, v) => u >= 0 && u <= 1 && v >= 0 && v <= 1;
+
+  // ---------- trail of influence points ----------
+  // Each point: opens fast, holds briefly, then glues back with an eased delay.
+  const ATTACK = 0.26, HOLD = 0.32, HEAL = 1.35, LIFESPAN = ATTACK + HOLD + HEAL;
+  const pts = [];  // {x, y, born, r, dx, dy}
+  function spawn(x, y, now) {
+    const p = { x, y, born: now, r: 0.14 + Math.random() * 0.07, dx: 0, dy: 0 };
+    if (pts.length < MAX_PTS) { pts.push(p); return; }
+    // full: replace the point with the least remaining life, never a fresh one
+    let k = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const a = now - pts[i].born;
+      const score = a < ATTACK + HOLD ? 2 - a : life(a);   // still opening/holding -> keep
+      if (score < best) { best = score; k = i; }
+    }
+    pts[k] = p;
+  }
+  const riseOf = age => { const a = Math.min(Math.max(age / ATTACK, 0), 1); return a * a * (3 - 2 * a); };
+  function life(age) {
+    if (age < 0) return 0;
+    const rise = riseOf(age);
+    const h = Math.min(Math.max((age - HOLD) / HEAL, 0), 1);
+    // ease-in-out healing with a gentle gooey shoulder
+    const heal = 1 - h * h * (3 - 2 * h);
+    return rise * heal;
+  }
+
+  // ---------- pointer ----------
+  const ptr = { x: -1e4, y: -1e4, u: -1, v: -1, inside: false, lastSpawnU: -9, lastSpawnV: -9, lastSpawnT: 0,
+                vx: 0, vy: 0, lastT: 0 };
+  function onMove(e, now) {
+    const [u, v] = toLocal(e.clientX, e.clientY);
+    const dt = Math.max(now - ptr.lastT, 1e-3);
+    if (ptr.lastT && ptr.u > -1) {
+      const ivx = (u - ptr.u) / dt, ivy = (v - ptr.v) / dt;
+      ptr.vx += (ivx - ptr.vx) * 0.35;
+      ptr.vy += (ivy - ptr.vy) * 0.35;
+    }
+    const wasInside = ptr.inside;
+    ptr.inside = isInside(u, v);
+    // leaving: drop one last point at the exit so it heals with the same delay
+    if (wasInside && !ptr.inside) spawn(Math.min(Math.max(u, 0), 1), Math.min(Math.max(v, 0), 1), now);
+    ptr.u = u; ptr.v = v; ptr.lastT = now;
+  }
+  const nowS = () => performance.now() / 1000;
+  canvas.addEventListener('pointermove', e => onMove(e, nowS()));
+  canvas.addEventListener('pointerdown', e => onMove(e, nowS()));
+  const leave = () => {
+    if (ptr.inside) spawn(ptr.u, ptr.v, nowS());
+    ptr.inside = false; ptr.u = -1; ptr.v = -1; ptr.lastT = 0;
+  };
+  canvas.addEventListener('pointerleave', leave);
+  canvas.addEventListener('pointercancel', leave);
+
+  // ---------- render loop ----------
+  const ptsArr = new Float32Array(MAX_PTS * 4);
+  const velArr = new Float32Array(MAX_PTS * 4);
+  const t0 = nowS();
+  let lastFrame = t0, idleFrames = 0;
+  addEventListener('resize', () => { idleFrames = 0; });
+
+  function frame() {
+    const now = nowS();
+    const dt = Math.min(now - lastFrame, 0.1);
+    lastFrame = now;
+    // velocity decays when the pointer rests (frame-rate independent)
+    const vDecay = Math.exp(-dt * 6);
+    ptr.vx *= vDecay; ptr.vy *= vDecay;
+
+    if (ptr.inside) {
+      const du = ptr.u - ptr.lastSpawnU, dv = ptr.v - ptr.lastSpawnV;
+      const moved = Math.hypot(du, dv);
+      // spacing grows with speed so the buffer always holds a full lifespan of trail
+      const speed = Math.hypot(ptr.vx, ptr.vy);
+      const minStep = Math.min(Math.max(0.022, speed * LIFESPAN / (MAX_PTS - 12)), 0.07);
+      if (moved > minStep || now - ptr.lastSpawnT > 0.11) {
+        spawn(ptr.u, ptr.v, now);
+        ptr.lastSpawnU = ptr.u; ptr.lastSpawnV = ptr.v; ptr.lastSpawnT = now;
+      }
+    }
+    const spring = 1 - Math.exp(-dt * 5);
+
+    let n = 0;
+    for (const p of pts) {
+      const l = life(now - p.born);
+      if (l <= 0.0005) continue;
+      // elastic drag: the opened area is pulled toward the live cursor, and springs back when it leaves
+      let tx = 0, ty = 0;
+      if (ptr.inside) {
+        tx = ptr.u - p.x; ty = ptr.v - p.y;
+        const len = Math.hypot(tx, ty), maxL = 0.07;
+        if (len > maxL) { tx *= maxL / len; ty *= maxL / len; }
+        tx *= 0.6; ty *= 0.6;
+      }
+      p.dx += (tx - p.dx) * spring; p.dy += (ty - p.dy) * spring;
+      // radius grows while opening, so cracks spread outward from the cursor
+      const r = p.r * (0.35 + 0.65 * riseOf(now - p.born));
+      ptsArr.set([p.x, p.y, l, r], n * 4);
+      velArr.set([p.dx, p.dy, 0, 0], n * 4);
+      n++;
+    }
+
+    // nothing alive and last frame already showed the untouched slab: skip redundant redraws
+    idleFrames = n === 0 ? idleFrames + 1 : 0;
+    if (idleFrames > 2) { schedule(); return; }
+
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform3f(U.uSq, sq.cx * dpr, (H - sq.cy) * dpr, sq.half * dpr);
+    gl.uniform1f(U.uTime, now - t0);
+    gl.uniform4fv(U.uPts, ptsArr);
+    gl.uniform4fv(U.uVel, velArr);
+    gl.uniform1i(U.uCount, n);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    schedule();
+  }
+  // rAF stalls in hidden/background tabs; fall back to a timer so the page still renders there
+  const schedule = () => document.hidden ? setTimeout(frame, 33) : requestAnimationFrame(frame);
+  schedule();
+})();
+</script>
+</body>
+</html>

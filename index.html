@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doodles</title>
+<meta name="description" content="Small interactive code demos.">
+<style>
+  :root {
+    --bg: #17110c; --card: #221911; --card-hover: #2c2016; --line: #3a2b1d;
+    --text: #f1e4d2; --muted: #b29c82; --accent: #ff8a2a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 56px 16px 80px; }
+  h1 { font-size: 2.2rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 40px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+  a.card {
+    display: block; text-decoration: none; color: inherit; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    transition: background .15s, transform .15s, border-color .15s;
+  }
+  a.card:hover, a.card:focus-visible { background: var(--card-hover); border-color: var(--accent); transform: translateY(-2px); outline: none; }
+  .thumb { aspect-ratio: 16 / 10; display: grid; place-items: center; }
+  .thumb.magma {
+    background: radial-gradient(ellipse at 30% 30%, #5a4128 0, #2e2013 70%);
+  }
+  .thumb.magma .slab {
+    width: 42%; aspect-ratio: 1; background: #000; box-shadow: 0 6px 18px rgba(0,0,0,.6);
+    background-image:
+      linear-gradient(62deg, transparent 47%, #ff6a10 49%, #ffe08a 50%, #ff6a10 51%, transparent 53%),
+      linear-gradient(-28deg, transparent 47.5%, #b82a04 49.3%, #ffb43c 50%, #b82a04 50.7%, transparent 52.5%);
+    background-size: 60% 60%, 55% 55%; background-position: 40% 45%, 70% 60%; background-repeat: no-repeat;
+  }
+  .meta { padding: 14px 16px 16px; }
+  .meta h2 { font-size: 1.05rem; margin: 0 0 4px; }
+  .meta p { margin: 0; color: var(--muted); font-size: .92rem; }
+  .meta time { display: block; margin-top: 10px; color: var(--muted); font-size: .8rem; opacity: .8; }
+  footer { margin-top: 56px; color: var(--muted); font-size: .85rem; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Doodles</h1>
+  <p class="sub">Small interactive code experiments.</p>
+
+  <!-- Add a new demo: copy a card, point href at the demo's folder. -->
+  <section class="grid">
+    <a class="card" href="magma-cracks/">
+      <div class="thumb magma"><div class="slab"></div></div>
+      <div class="meta">
+        <h2>Magma Cracks</h2>
+        <p>Hover the black slab: connected magma cracks open, follow the cursor, then glue back without a trace.</p>
+        <time datetime="2026-11-08">Nov 2026 · WebGL2</time>
+      </div>
+    </a>
+  </section>
+
+  <footer>Source on <a href="https://github.com/vcostin/doodles">GitHub</a>.</footer>
+</main>
+</body>
+</html>
