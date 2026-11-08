@@ -232,7 +232,10 @@ void main() {
   // Each plate = (its Voronoi cell ∩ the slab footprint), rigidly translated by the field at its site.
   // Rim plates can therefore slide out over the mud or pull in from the edge: the margin mutates.
   float sd1 = 1e3, sd2 = 1e3;   // signed distance to nearest / second plate (lattice units)
-  vec2 o1 = vec2(0.0);
+  vec2 o1 = vec2(0.0), o2 = vec2(0.0);
+  vec2 s1 = vec2(0.0), s2 = vec2(1.0);
+  float clip1 = 1e3, clip2 = 1e3;   // distance to each nearest plate's moved footprint box
+  float sdV1 = 1e3;                 // Voronoi-only distance (footprint clip ignored)
   float rimEdge1 = 0.0;         // 1 when the nearest plate's closest edge is the slab outline
   for (int cj = -1; cj <= 1; cj++)
   for (int ci = -1; ci <= 1; ci++) {
@@ -265,16 +268,13 @@ void main() {
       sd = max(sd, dot(Y - 0.5 * (sk + sj), normalize(sj - sk)));
     }
     float rimE = smoothstep(-0.5 * pxL0, 0.5 * pxL0, sdClip - sd);
+    sdV1 = min(sdV1, sd);
     sd = max(sd, sdClip);
-    if (sd < sd1) { sd2 = sd1; sd1 = sd; o1 = ok * S; rimEdge1 = rimE; }
-    else if (sd < sd2) { sd2 = sd; }
+    if (sd < sd1) { sd2 = sd1; o2 = o1; clip2 = clip1; s2 = s1; sd1 = sd; o1 = ok * S; clip1 = sdClip; s1 = sk; rimEdge1 = rimE; }
+    else if (sd < sd2) { sd2 = sd; o2 = ok * S; clip2 = sdClip; s2 = sk; }
   }
-  // A gap whose nearest wall is the original rim (not another plate) is a notch in the outline:
-  // show mud there, never a magma bar along the edge.
+  // rim plates never retreat, so every gap is between two plates (no rim wall)
   float pxL = pxL0;
-  float rimD = max(-sdSq * S, 0.0);
-  float rimWall = sd1 > 0.0 ? max(smoothstep(-pxL, pxL, sd2 - rimD), smoothstep(-2.0 * px, 0.0, sdSq)) : 0.0;
-  if (sd1 > 0.0) sd2 = min(sd2, rimD);
 
   float cover = 1.0 - smoothstep(-pxL, pxL, sd1);
   float heat = smoothstep(0.05, 0.7, I);
@@ -309,8 +309,28 @@ void main() {
 
   // Magma only lies beneath the original footprint; outside it, uncovered ground is mud,
   // shadowed by whichever plates have slid out over it.
-  vec3 outside = mix(mudC * mix(0.45, 1.0, smoothstep(0.0, 0.06, max(sd1, 0.0) / S)), rock, cover);
-  col = mix(outside, slab, inside * (1.0 - rimWall));
+  // Outside the original footprint, magma still fills any gap *between* plates (e.g. behind a
+  // corner that slid out), bulging into the mud with a rounded, cooler meniscus where the gap
+  // opens wide toward the outside. Open ground with no plate across it stays mud.
+  // Only a gap the two plates actually opened by moving apart (width ~ |o1 - o2|) gets magma, so
+  // unmoved neighbours along the rim never produce a line, and the gap's mouth rounds off into mud.
+  float Gp = sd1 + max(sd2, 0.0);
+  // separation perpendicular to the shared boundary only (sliding past each other opens nothing)
+  float D = clamp(dot(o1 - o2, normalize(s1 - s2 + 1e-5)), 0.0, 0.55);
+  float outMask = sd1 > 0.0 ? 1.0 - smoothstep(0.75 * D, 1.25 * D + pxL, Gp) : 0.0;
+  outMask *= smoothstep(1.5 * pxL, 4.0 * pxL, D);
+  // never bulge beyond the outer face of the plate that slid out furthest
+  outMask *= 1.0 - smoothstep(0.0, 0.25 * D + pxL, min(clip1, clip2));
+  float dcP = abs(sd1 - 0.5 * Gp) / max(0.5 * Gp, 1e-4);
+  vec3 lavaP = magmaRamp(max(dcP, 1.0 - smoothstep(0.0, 0.7, outMask)), gheat)
+             * mix(1.0, 0.75 + 0.5 * flow, smoothstep(pxL, 4.0 * pxL, Gp));
+  vec3 ground = mudC * mix(0.45, 1.0, smoothstep(0.0, 0.06, max(sd1, 0.0) / S));
+  vec3 outside = mix(mix(ground, lavaP, outMask), rock, cover);
+  // carry inside cracks a few px past the old footprint line and fade, so there is no seam there
+  float dOut = max(sdSq, 0.0) * S;
+  float carry = (1.0 - smoothstep(0.0, 4.0 * pxL + 0.3 * D, dOut)) * cov * smoothstep(0.0, pxL, sdV1)   // pixel really lies between moved cells
+              * smoothstep(1.5 * pxL, 4.0 * pxL, D);   // only real openings, never along an unmoved rim
+  col = mix(outside, slab, max(inside, carry));
   fragColor = vec4(pow(col, vec3(0.92)), 1.0);
 }
 </script>
