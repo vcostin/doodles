@@ -60,9 +60,11 @@ out vec4 fragColor;
 
 const float PUSH = 0.026;   // how far plates are shoved away from the cursor (uv)
 const float DRANGE = 0.07;  // encoding range for displacement
+const float FM = 0.15;      // field covers [-FM, 1+FM] so rim plates can move out over the mud
 
 void main() {
-  vec2 lp = gl_FragCoord.xy / uFieldRes;
+  vec2 lp = gl_FragCoord.xy / uFieldRes * (1.0 + 2.0 * FM) - FM;
+  float act = 0.0;          // generous mask: where plates may be moving at all
   float keep = 1.0;
   vec2 push = vec2(0.0), drag = vec2(0.0);
   float wsum = 0.0;
@@ -80,15 +82,11 @@ void main() {
     push += d / (length(d) + 0.03) * fp;  // away from the point
     drag += uVel[i].xy * c;               // toward the live cursor
     wsum += c;
+    act = max(act, step(length(d), P.w * 1.6 + 0.22));
   }
   float I = 1.0 - keep;
-  vec2 dq = abs(lp - 0.5) - 0.5;
-  float border = smoothstep(0.0, 0.07, -max(dq.x, dq.y));   // slab rim never moves
-  // displacement is NOT pinned at the rim (that opened a crack tracing the edge);
-  // the rim stays intact because I is zeroed there, so no cracks are drawn near it.
-  vec2 disp = (push * PUSH + drag) / max(wsum, 1.0) * I;
-  disp = clamp(disp, -DRANGE, DRANGE);
-  fragColor = vec4(I * border, disp / (2.0 * DRANGE) + 0.5, 1.0);
+  vec2 disp = clamp((push * PUSH + drag) / max(wsum, 1.0) * I, -DRANGE, DRANGE);
+  fragColor = vec4(I, disp / (2.0 * DRANGE) + 0.5, act);
 }
 </script>
 
@@ -101,11 +99,17 @@ uniform sampler2D uField;
 out vec4 fragColor;
 
 const float DRANGE = 0.07;
-const float S = 6.0;       // plates across the slab
+const float FM = 0.15;
+const float S = 7.0;       // plates across the slab
 
+vec4 fieldRaw(vec2 uv) { return texture(uField, clamp((uv + FM) / (1.0 + 2.0 * FM), 0.0, 1.0)); }
 vec3 field(vec2 uv) {      // xy: displacement (uv), z: intensity
-  vec4 f = texture(uField, clamp(uv, 0.0, 1.0));
+  vec4 f = fieldRaw(uv);
   return vec3((f.gb - 0.5) * 2.0 * DRANGE, f.r);
+}
+float sdBox(vec2 p) {      // signed distance to the slab footprint (uv)
+  vec2 q = abs(p - 0.5) - 0.5;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
 }
 
 float voronoiEdge(vec2 x) {   // distance to nearest Voronoi border (IQ)
@@ -191,86 +195,122 @@ void main() {
   float sdSq = length(max(dq, 0.0)) + min(max(dq.x, dq.y), 0.0);
   float inside = 1.0 - smoothstep(-px, px, sdSq);
 
-  vec3 col = vec3(0.0);
-  if (inside < 1.0) col = mud(frag) * mix(0.45, 1.0, smoothstep(0.0, 0.06, sdSq));
+  vec3 mudC = inside < 1.0 ? mud(frag) : vec3(0.0);
+  vec3 col;
 
-  vec3 slab = vec3(0.0);
-  float I = inside > 0.0 ? field(lp).z : 0.0;
-  if (I > 0.003) {
-    // Static (cursor-independent) warp gives plates jagged, organic outlines.
-    vec2 W = 0.42 * vec2(fbm(lp * 4.0), fbm(lp * 4.0 + 5.2)) - 0.21
-           + 0.16 * vec2(fbm(lp * 14.0 + 2.0), fbm(lp * 14.0 + 9.0)) - 0.08
-           + 0.07 * vec2(vnoise(lp * 40.0), vnoise(lp * 40.0 + 7.0)) - 0.035;
-    vec2 X = lp * S + W;
-    vec2 n = floor(X);
+  vec4 F0 = sdSq < 0.14 ? fieldRaw(lp) : vec4(0.0);
+  if (F0.a < 0.5) {
+    // untouched: plain slab with a soft contact shadow
+    col = mix(mudC * mix(0.45, 1.0, smoothstep(0.0, 0.06, sdSq)), vec3(0.0), inside);
+    fragColor = vec4(pow(col, vec3(0.92)), 1.0);
+    return;
+  }
+  float I = F0.r;
 
-    vec2 site[25];
-    for (int j = -2; j <= 2; j++)
-    for (int i = -2; i <= 2; i++) {
-      vec2 g = n + vec2(float(i), float(j));
-      site[(j + 2) * 5 + (i + 2)] = g + 0.15 + 0.7 * hash2(g);
-    }
+  // Static (cursor-independent) warp gives plates jagged, organic outlines.
+  vec2 W = 0.42 * vec2(fbm(lp * 4.0), fbm(lp * 4.0 + 5.2)) - 0.21
+         + 0.16 * vec2(fbm(lp * 14.0 + 2.0), fbm(lp * 14.0 + 9.0)) - 0.08
+         + 0.07 * vec2(vnoise(lp * 40.0), vnoise(lp * 40.0 + 7.0)) - 0.035;
+  vec2 X = lp * S + W;
+  vec2 n = floor(X);
+  float pxL0 = px * S;
 
-    // Each candidate plate is rigidly translated by the field sampled at its own site.
-    // A pixel is rock if it falls inside any translated plate, magma otherwise.
-    float sd1 = 1e3, sd2 = 1e3;   // signed distance to the nearest / second plate (lattice units)
-    vec2 o1 = vec2(0.0), s1 = vec2(0.0), s2 = vec2(0.0);
-    for (int cj = -1; cj <= 1; cj++)
-    for (int ci = -1; ci <= 1; ci++) {
-      int k = (cj + 2) * 5 + (ci + 2);
-      vec2 sk = site[k];
-      vec2 ok = field(sk / S).xy * S;
-      vec2 Y = X - ok;
-      float sd = -1e3;
-      for (int nj = -1; nj <= 1; nj++)
-      for (int ni = -1; ni <= 1; ni++) {
-        if (ni == 0 && nj == 0) continue;
-        vec2 sj = site[k + nj * 5 + ni];
-        sd = max(sd, dot(Y - 0.5 * (sk + sj), normalize(sj - sk)));
-      }
-      if (sd < sd1) { sd2 = sd1; s2 = s1; sd1 = sd; o1 = ok; s1 = sk; }
-      else if (sd < sd2) { sd2 = sd; s2 = sk; }
-    }
-
-    float pxL = px * S;
-    float heat = smoothstep(0.05, 0.7, I);
-    float G = max(sd1 + max(sd2, 0.0), 1e-5);           // gap width (lattice units)
-    float rockIn = step(sd1, 0.0);
-    // plates whose site lies outside the slab are only padding: never crack along them
-    // (otherwise a crack traces the rim, since the lattice is aligned with the slab edges)
-    vec2 q1 = abs(s1 / S - 0.5) - 0.5, q2 = abs(s2 / S - 0.5) - 0.5;
-    float inPlates = step(max(max(q1.x, q1.y), max(q2.x, q2.y)), 0.0);
-    float dEdge = -sd1;                                  // depth inside own plate
-
-    // --- rock: faint heat only beside real gaps
-    float edgeGlow = exp(min(sd1, 0.0) / 0.03) * I * I * smoothstep(0.0, 3.0 * pxL, G) * inPlates;
-    slab = vec3(0.09, 0.009, 0.0) * edgeGlow;
-
-    // --- hairline fractures that ride with the plate: open, branching, tapered tips
-    vec2 Yl = X - o1;
-    float eh = voronoiEdgeFree(Yl * 2.4 + 3.3) / 2.4;
-    float wh = smoothstep(0.5, 1.0, I) * 0.03 * (0.4 + vnoise(Yl * 6.0))
-             * smoothstep(0.28, 0.55, vnoise(Yl * 3.0 + 1.7));          // drop segments
-    float hm = (1.0 - smoothstep(wh - pxL, wh + pxL, eh)) * smoothstep(0.5 * pxL, 1.5 * pxL, wh);
-    hm *= smoothstep(0.0, 3.0 * pxL, dEdge);             // end at the plate boundary, never sheared
-    slab = mix(slab, magmaRamp(0.35 + 0.65 * pow(eh / max(wh, 1e-4), 0.6), heat * 0.8), hm * rockIn);
-
-    // --- one crack per plate boundary: the opened gap plus a thin rim crack, drawn with a single
-    //     profile measured from the gap centerline -> hottest on the centerline at every width.
-    float bw = smoothstep(0.55, 0.95, I) * 0.018 * (0.6 + 0.8 * vnoise(X * 5.0))
-             * smoothstep(0.3, 0.6, vnoise(X * 2.0 + 4.1));   // not every boundary is traced
-    float hw = 0.5 * G + bw;                 // visible half-width
-    float dc = abs(sd1 - 0.5 * G);           // distance from the gap centerline
-    float cov = (1.0 - smoothstep(hw - pxL, hw + pxL, dc)) * smoothstep(0.5 * pxL, 1.5 * pxL, hw);
-    cov *= smoothstep(0.0, 0.03, -max(dq.x, dq.y)) * inPlates;   // nothing hugs the slab rim
-    float flow = fbm(lp * 40.0 + vec2(uTime * 0.35, -uTime * 0.6));
-    float gheat = heat * mix(0.7, 1.0, smoothstep(0.0, 0.12, G));
-    vec3 lava = magmaRamp(dc / max(hw, 1e-4), gheat)
-              * mix(1.0, 0.75 + 0.5 * flow, smoothstep(pxL, 4.0 * pxL, G));
-    slab = mix(slab, lava, cov);
+  // Only sites inside the footprint are plates; outer cells simply extend to the rim.
+  // (No padding plates -> no crack running parallel to the edge.)
+  vec2 site[25];
+  float ok_[25];
+  for (int j = -2; j <= 2; j++)
+  for (int i = -2; i <= 2; i++) {
+    vec2 g = n + vec2(float(i), float(j));
+    vec2 sp = g + 0.1 + 0.8 * hash2(g);
+    int id = (j + 2) * 5 + (i + 2);
+    site[id] = sp;
+    vec2 su = sp / S;
+    ok_[id] = step(0.0, su.x) * step(su.x, 1.0) * step(0.0, su.y) * step(su.y, 1.0);
   }
 
-  col = mix(col, slab, inside);
+  // Each plate = (its Voronoi cell ∩ the slab footprint), rigidly translated by the field at its site.
+  // Rim plates can therefore slide out over the mud or pull in from the edge: the margin mutates.
+  float sd1 = 1e3, sd2 = 1e3;   // signed distance to nearest / second plate (lattice units)
+  vec2 o1 = vec2(0.0);
+  float rimEdge1 = 0.0;         // 1 when the nearest plate's closest edge is the slab outline
+  for (int cj = -1; cj <= 1; cj++)
+  for (int ci = -1; ci <= 1; ci++) {
+    int k = (cj + 2) * 5 + (ci + 2);
+    if (ok_[k] < 0.5) continue;
+    vec2 sk = site[k];
+    vec2 ok = field(sk / S).xy;
+    ok *= step(1e-3, length(ok));   // drop the 8-bit encoding bias (~0.0003 uv)
+    // rim plates never retreat into the slab: the inward push is reflected outward, plus a small
+    // heave with local intensity, so the margin bulges and slides over the mud near the cursor
+    vec2 su = sk / S;
+    float e = 1.0 / S;
+    float Is = field(su).z;
+    if (su.x < e)       ok.x = -abs(ok.x) * 1.6 - 0.018 * Is;
+    if (su.x > 1.0 - e) ok.x =  abs(ok.x) * 1.6 + 0.018 * Is;
+    if (su.y < e)       ok.y = -abs(ok.y) * 1.6 - 0.018 * Is;
+    if (su.y > 1.0 - e) ok.y =  abs(ok.y) * 1.6 + 0.018 * Is;
+    ok = clamp(ok, -0.06, 0.06);   // stay within the 3x3 plate search when sliding over the mud
+    vec2 Y = X - ok * S;
+    // moved plates get a ragged outer face; unmoved ones keep the exact straight edge (pristine at rest)
+    vec2 rag = 0.007 * (vec2(vnoise(lp * 30.0), vnoise(lp * 30.0 + 3.0)) - 0.5) * clamp(length(ok) * 60.0, 0.0, 1.0);
+    float sdClip = sdBox(lp - ok + rag) * S;
+    float sd = -1e3;
+    for (int nj = -1; nj <= 1; nj++)
+    for (int ni = -1; ni <= 1; ni++) {
+      if (ni == 0 && nj == 0) continue;
+      int j2 = k + nj * 5 + ni;
+      if (ok_[j2] < 0.5) continue;
+      vec2 sj = site[j2];
+      sd = max(sd, dot(Y - 0.5 * (sk + sj), normalize(sj - sk)));
+    }
+    float rimE = smoothstep(-0.5 * pxL0, 0.5 * pxL0, sdClip - sd);
+    sd = max(sd, sdClip);
+    if (sd < sd1) { sd2 = sd1; sd1 = sd; o1 = ok * S; rimEdge1 = rimE; }
+    else if (sd < sd2) { sd2 = sd; }
+  }
+  // A gap whose nearest wall is the original rim (not another plate) is a notch in the outline:
+  // show mud there, never a magma bar along the edge.
+  float pxL = pxL0;
+  float rimD = max(-sdSq * S, 0.0);
+  float rimWall = sd1 > 0.0 ? max(smoothstep(-pxL, pxL, sd2 - rimD), smoothstep(-2.0 * px, 0.0, sdSq)) : 0.0;
+  if (sd1 > 0.0) sd2 = min(sd2, rimD);
+
+  float cover = 1.0 - smoothstep(-pxL, pxL, sd1);
+  float heat = smoothstep(0.05, 0.7, I);
+  float G = max(sd1 + max(sd2, 0.0), 1e-5);           // gap width (lattice units)
+  float rockIn = step(sd1, 0.0);
+  float dEdge = -sd1;
+
+  // --- rock: faint heat only beside real gaps
+  float notRim = 1.0 - rimEdge1;   // no heat / rim crack along the slab outline itself
+  vec3 rock = vec3(0.09, 0.009, 0.0) * exp(min(sd1, 0.0) / 0.03) * I * I * smoothstep(0.0, 3.0 * pxL, G) * notRim;
+
+  // --- hairline fractures that ride with the plate: open, branching, tapered tips
+  vec2 Yl = X - o1;
+  float eh = voronoiEdgeFree(Yl * 2.4 + 3.3) / 2.4;
+  float wh = smoothstep(0.5, 1.0, I) * 0.03 * (0.4 + vnoise(Yl * 6.0))
+           * smoothstep(0.28, 0.55, vnoise(Yl * 3.0 + 1.7));
+  float hm = (1.0 - smoothstep(wh - pxL, wh + pxL, eh)) * smoothstep(0.5 * pxL, 1.5 * pxL, wh);
+  hm *= smoothstep(0.0, 3.0 * pxL, dEdge);
+  rock = mix(rock, magmaRamp(0.35 + 0.65 * pow(eh / max(wh, 1e-4), 0.6), heat * 0.8), hm * rockIn);
+
+  // --- one crack per plate boundary (gap + thin rim crack), single profile from the gap centerline
+  float bw = smoothstep(0.55, 0.95, I) * 0.018 * (0.6 + 0.8 * vnoise(X * 5.0))
+           * smoothstep(0.3, 0.6, vnoise(X * 2.0 + 4.1)) * (sd1 > 0.0 ? 1.0 : notRim);
+  float hw = 0.5 * G + bw;
+  float dc = abs(sd1 - 0.5 * G);
+  float cov = (1.0 - smoothstep(hw - pxL, hw + pxL, dc)) * smoothstep(0.5 * pxL, 1.5 * pxL, hw);
+  float flow = fbm(lp * 40.0 + vec2(uTime * 0.35, -uTime * 0.6));
+  float gheat = heat * mix(0.7, 1.0, smoothstep(0.0, 0.12, G));
+  vec3 lava = magmaRamp(dc / max(hw, 1e-4), gheat)
+            * mix(1.0, 0.75 + 0.5 * flow, smoothstep(pxL, 4.0 * pxL, G));
+  vec3 slab = mix(rock, lava, cov);
+
+  // Magma only lies beneath the original footprint; outside it, uncovered ground is mud,
+  // shadowed by whichever plates have slid out over it.
+  vec3 outside = mix(mudC * mix(0.45, 1.0, smoothstep(0.0, 0.06, max(sd1, 0.0) / S)), rock, cover);
+  col = mix(outside, slab, inside * (1.0 - rimWall));
   fragColor = vec4(pow(col, vec3(0.92)), 1.0);
 }
 </script>
@@ -333,7 +373,7 @@ void main() {
     W = innerWidth; H = innerHeight;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
-    sq.half = Math.min(W, H) * 0.27;
+    sq.half = Math.min(W, H) * 0.37;
     sq.cx = W / 2; sq.cy = H / 2;
     idleFrames = 0;
   }
