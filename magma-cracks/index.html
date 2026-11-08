@@ -12,11 +12,16 @@
   #back { position: fixed; top: 14px; left: 16px; color: rgba(241,228,210,.55); text-decoration: none;
           font: 13px/1 system-ui, sans-serif; letter-spacing: .02em; transition: color .15s; }
   #back:hover, #back:focus-visible { color: rgba(241,228,210,.95); }
+  #snd { position: fixed; right: 16px; bottom: 14px; background: none; border: 0; padding: 6px 0; cursor: pointer;
+         color: rgba(241,228,210,.55); font: 13px/1 system-ui, sans-serif; letter-spacing: .02em; transition: color .15s; }
+  #snd:hover, #snd:focus-visible { color: rgba(241,228,210,.95); outline: none; }
+  #snd.on { color: rgba(255,170,80,.85); }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <a id="back" href="../">← Doodles</a>
+<button id="snd" type="button" aria-pressed="false">Sound off · click to enable</button>
 <div id="err">WebGL2 is required for this demo.</div>
 
 <script id="vs" type="x-shader/x-vertex">#version 300 es
@@ -406,6 +411,157 @@ void main() {
   ];
   const isInside = (u, v) => u >= 0 && u <= 1 && v >= 0 && v <= 1;
 
+  // ---------- sound (Web Audio, fully synthesized) ----------
+  const Sound = (() => {
+    let ctx = null, master, on = false;
+    let rumbleG, hissG, grindG, grindF, white, brown, lastCrack = 0, lastCrunch = 0, lastGloop = 0, susTimer = 0;
+    function noise(kind) {
+      const len = ctx.sampleRate * 2, b = ctx.createBuffer(1, len, ctx.sampleRate), d = b.getChannelData(0);
+      let last = 0;
+      for (let i = 0; i < len; i++) {
+        const w = Math.random() * 2 - 1;
+        if (kind === 'brown') { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w;
+      }
+      // remove the end-to-start jump so the loop is seamless
+      if (kind === 'brown') { const e = d[len - 1] - d[0]; for (let i = 0; i < len; i++) d[i] -= e * i / (len - 1); }
+      return b;
+    }
+    function loop(buf) { const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true; s.start(0, Math.random() * buf.duration); return s; }
+    function filt(type, f, q = 0.7) { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; b.Q.value = q; return b; }
+    function out(pan) { const p = ctx.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, pan)); p.connect(master); return p; }
+    function env(g, t, a, peak, d) {   // quick attack, exponential decay
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + a);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+    }
+    function init() {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = ctx.createGain(); master.gain.value = 0;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -16; comp.ratio.value = 4;
+      master.connect(comp).connect(ctx.destination);
+      white = noise('white'); brown = noise('brown');
+      // magma rumble: brown noise + a slow sub hum, swelling with how much is open
+      rumbleG = ctx.createGain(); rumbleG.gain.value = 0; rumbleG.connect(master);
+      loop(brown).connect(filt('lowpass', 140)).connect(rumbleG);
+      const hum = ctx.createOscillator(); hum.frequency.value = 46;
+      const humG = ctx.createGain(); humG.gain.value = 0.22;
+      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.31;
+      const lfoG = ctx.createGain(); lfoG.gain.value = 4; lfo.connect(lfoG).connect(hum.frequency);
+      hum.connect(humG).connect(rumbleG); hum.start(); lfo.start();
+      // cooling hiss while cracks glue back
+      hissG = ctx.createGain(); hissG.gain.value = 0; hissG.connect(master);
+      loop(white).connect(filt('highpass', 3800)).connect(filt('lowpass', 9000)).connect(hissG);
+      // stone grind while rim plates slide
+      grindG = ctx.createGain(); grindG.gain.value = 0; grindG.connect(master);
+      grindF = filt('bandpass', 260, 1.4);
+      loop(brown).connect(grindF).connect(grindG);
+    }
+    // sharp stone crackle: a cluster of tiny band-passed noise ticks
+    function crackle(x, strength) {
+      if (!on) return;
+      const t0 = ctx.currentTime;
+      if (t0 - lastCrack < 0.035) return;
+      lastCrack = t0;
+      const o = out((x - 0.5) * 1.4);
+      const count = 2 + Math.floor(strength * 6 * Math.random());
+      for (let i = 0; i < count; i++) {
+        const t = t0 + (i ? Math.random() * 0.14 : 0);
+        const src = ctx.createBufferSource(); src.buffer = white;
+        const g = ctx.createGain();
+        const bp = filt('bandpass', 1400 + Math.random() * 5200, 2 + Math.random() * 7);
+        src.connect(bp).connect(g).connect(o);
+        const dur = 0.004 + Math.random() * 0.03;
+        env(g, t, 0.001, (0.12 + 0.4 * Math.random()) * strength, dur);
+        src.start(t, Math.random() * 1.5, dur + 0.02);
+      }
+    }
+    // deep crunch for a bigger break (entering the slab, fast moves)
+    function crunch(x, strength) {
+      if (!on) return;
+      if (ctx.currentTime - lastCrunch < 0.09) return crackle(x, strength);
+      lastCrunch = ctx.currentTime;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.2);
+      const src = ctx.createBufferSource(); src.buffer = white;
+      const g = ctx.createGain();
+      src.connect(filt('lowpass', 520, 1.2)).connect(g).connect(o);
+      env(g, t, 0.003, 0.55 * strength, 0.12);
+      src.start(t, Math.random() * 1.5, 0.2);
+      const th = ctx.createOscillator(), tg = ctx.createGain();
+      th.frequency.setValueAtTime(95, t); th.frequency.exponentialRampToValueAtTime(38, t + 0.14);
+      th.connect(tg).connect(o); env(tg, t, 0.004, 0.35 * strength, 0.16);
+      th.start(t); th.stop(t + 0.25);
+      crackle(x, strength);
+    }
+    // magma bubble: a pitch-dropping blip through a low-pass
+    function bubble(x) {
+      if (!on) return;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.4);
+      const f0 = 120 + Math.random() * 240;
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.frequency.setValueAtTime(f0, t);
+      osc.frequency.exponentialRampToValueAtTime(f0 * 0.45, t + 0.1);
+      osc.connect(filt('lowpass', 900)).connect(g).connect(o);
+      env(g, t, 0.006, 0.07 + Math.random() * 0.07, 0.11);
+      osc.start(t); osc.stop(t + 0.2);
+    }
+    // gooey gloop as a crack starts to seal
+    function gloop(x) {
+      if (!on) return;
+      if (ctx.currentTime - lastGloop < 0.06) return;
+      lastGloop = ctx.currentTime;
+      const t = ctx.currentTime + Math.random() * 0.05, o = out((x - 0.5) * 1.4);
+      const osc = ctx.createOscillator(), g = ctx.createGain(), lp = filt('lowpass', 1400, 3);
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(210 + Math.random() * 60, t);
+      osc.frequency.exponentialRampToValueAtTime(80, t + 0.2);
+      lp.frequency.setValueAtTime(1400, t); lp.frequency.exponentialRampToValueAtTime(260, t + 0.22);
+      osc.connect(lp).connect(g).connect(o);
+      env(g, t, 0.012, 0.09, 0.22);
+      osc.start(t); osc.stop(t + 0.3);
+    }
+    // continuous layers follow the simulation each frame
+    function update(m, dt) {
+      if (!on) return;
+      const t = ctx.currentTime;
+      rumbleG.gain.setTargetAtTime(Math.min(1, m.total * 0.1) * 0.55, t, 0.2);
+      hissG.gain.setTargetAtTime(Math.min(1, m.healing * 0.12) * 0.05, t, 0.12);
+      grindG.gain.setTargetAtTime(Math.min(1, m.rim) * 0.45, t, 0.08);
+      grindF.frequency.setTargetAtTime(200 + Math.min(1, m.rim) * 260, t, 0.1);
+      if (Math.random() < Math.min(m.total, 8) * 0.55 * dt) bubble(m.x);
+    }
+    function setOn(v) {
+      if (!ctx) init();
+      on = v;
+      const t = ctx.currentTime;
+      clearTimeout(susTimer);
+      if (on) ctx.resume();
+      else {
+        // zero the continuous layers so re-enabling never replays a stale rumble, then suspend (saves CPU)
+        for (const g of [rumbleG, hissG, grindG]) { g.gain.cancelScheduledValues(t); g.gain.setTargetAtTime(0, t, 0.05); }
+        susTimer = setTimeout(() => { if (!on) ctx.suspend(); }, 400);
+      }
+      master.gain.setTargetAtTime(on ? 0.9 : 0, t, 0.05);
+    }
+    // audio must never break the render loop
+    const safe = fn => (...a) => { try { return fn(...a); } catch (e) { on = false; console.warn('sound disabled:', e); } };
+    return { crackle: safe(crackle), crunch: safe(crunch), gloop: safe(gloop), update: safe(update),
+             setOn, get on() { return on; } };
+  })();
+
+  const sndBtn = document.getElementById('snd');
+  function toggleSound() {
+    Sound.setOn(!Sound.on);
+    sndBtn.textContent = Sound.on ? 'Sound on' : 'Sound off · click to enable';
+    sndBtn.classList.toggle('on', Sound.on);
+    sndBtn.setAttribute('aria-pressed', String(Sound.on));
+  }
+  sndBtn.addEventListener('click', toggleSound);
+  addEventListener('keydown', e => {
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'm' || e.key === 'M') toggleSound();
+  });
+
   // ---------- trail of influence points ----------
   // Each point: opens, holds briefly, then glues back with an eased delay.
   const ATTACK = 0.26, HOLD = 0.32, HEAL = 1.35, LIFESPAN = ATTACK + HOLD + HEAL;
@@ -420,8 +576,11 @@ void main() {
   function spawn(x, y, now) {
     // radius from a position hash (not Math.random) so re-touching a spot is stable
     const hr = Math.abs(Math.sin(x * 127.1 + y * 311.7) * 43758.5453) % 1;
-    const p = { x, y, born: now, r: 0.14 + hr * 0.07, dx: 0, dy: 0 };
+    const p = { x, y, born: now, r: 0.14 + hr * 0.07, dx: 0, dy: 0, lastL: 0, sealed: false };
     lastSpawned = p;
+    const sp = Math.hypot(ptr.vx, ptr.vy);
+    if (sp > 1.6) Sound.crunch(x, Math.min(1, 0.5 + sp * 0.15));
+    else Sound.crackle(x, Math.min(1, 0.4 + sp * 0.35));
     if (pts.length < MAX_PTS) { pts.push(p); return; }
     // full: replace the point with the least remaining life, never one still opening/holding
     let k = 0, best = Infinity;
@@ -446,6 +605,7 @@ void main() {
     }
     const wasInside = ptr.inside;
     ptr.inside = isInside(u, v);
+    if (!wasInside && ptr.inside) Sound.crunch(u, 0.8);
     // leaving: drop one last point at the exit so it heals with the same delay
     if (wasInside && !ptr.inside) {
       const eu = Math.min(Math.max(u, 0), 1), ev = Math.min(Math.max(v, 0), 1);
@@ -494,10 +654,22 @@ void main() {
     }
 
     const spring = 1 - Math.exp(-dt * 5);
-    let n = 0;
+    const m = { total: 0, healing: 0, rim: 0, x: 0.5 };
+    const ptrSpeed = Math.min(1, Math.hypot(ptr.vx, ptr.vy) * 0.8);
+    let n = 0, xw = 0;
     for (const p of pts) {
-      const l = life(now - p.born);
+      const age = now - p.born;
+      const l = life(age);
+      const dl = (l - (p.lastL || 0)) / Math.max(dt, 1e-3);
+      p.lastL = l;
       if (l <= 0.0005) continue;
+      // sound metrics
+      m.total += l; xw += l * p.x;
+      if (dl < 0) m.healing += -dl;
+      if (!p.sealed && dl < 0 && age > ATTACK + HOLD * 0.5 + 0.02) { p.sealed = true; if (Math.random() < 0.45) Sound.gloop(p.x); }
+      const edge = Math.min(p.x, 1 - p.x, p.y, 1 - p.y);
+      const nearRim = 1 - Math.min(Math.max(edge / 0.16, 0), 1);
+      m.rim = Math.max(m.rim, nearRim * l * (ptrSpeed + Math.max(-dl, 0) * 0.35));
       // elastic drag: plates near the trail are pulled toward the live cursor, spring back when it leaves
       let tx = 0, ty = 0;
       if (ptr.inside) {
@@ -513,6 +685,9 @@ void main() {
       velArr.set([p.dx, p.dy, 0, 0], n * 4);
       n++;
     }
+
+    if (m.total > 0) m.x = xw / m.total;
+    Sound.update(m, dt);
 
     // nothing alive and the last frames already showed the untouched slab: skip redundant redraws
     idleFrames = n === 0 ? idleFrames + 1 : 0;
