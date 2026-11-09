@@ -1,0 +1,926 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magma Boat</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a0f09; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #f3d9b1;
+         font: 14px/1.4 system-ui, sans-serif; text-align: center; padding: 16px; }
+  #back { position: fixed; top: 14px; left: 16px; color: rgba(241,228,210,.55); text-decoration: none;
+          font: 13px/1 system-ui, sans-serif; letter-spacing: .02em; transition: color .15s; }
+  #back:hover, #back:focus-visible { color: rgba(241,228,210,.95); }
+  #snd { position: fixed; right: 16px; bottom: 14px; background: none; border: 0; padding: 6px 0; cursor: pointer;
+         color: rgba(241,228,210,.55); font: 13px/1 system-ui, sans-serif; letter-spacing: .02em; transition: color .15s; }
+  #snd:hover, #snd:focus-visible { color: rgba(241,228,210,.95); outline: none; }
+  #snd.on { color: rgba(255,170,80,.85); }
+  #hint { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); pointer-events: none;
+          color: rgba(241,228,210,.6); font: 13px/1 system-ui, sans-serif; letter-spacing: .03em;
+          transition: opacity 1.2s; white-space: nowrap; }
+  #hint.gone { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="back" href="../">← Doodles</a>
+<div id="hint">Point to steer · further = faster</div>
+<button id="snd" type="button" aria-pressed="false">Sound off · click to enable</button>
+<div id="err">WebGL2 is required for this demo.</div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<!-- Shared helpers. Integer hash so the endless world stays stable far from the origin. -->
+<script id="common" type="x-shader/x-fragment">
+uvec2 pcg2d(uvec2 v) {
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+  v ^= v >> 16u;
+  v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+  v ^= v >> 16u;
+  return v;
+}
+vec2 hash2(vec2 p) { return vec2(pcg2d(uvec2(ivec2(floor(p + 0.5))))) * (1.0 / 4294967295.0); }
+float hash1(vec2 p) { return hash2(p).x; }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash1(i), b = hash1(i + vec2(1, 0)), c = hash1(i + vec2(0, 1)), d = hash1(i + vec2(1, 1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbmN(vec2 p, int oct) {
+  float s = 0.0, a = 0.5;
+  mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 6; i++) { if (i >= oct) break; s += a * vnoise(p); p = r * p * 2.03 + 11.7; a *= 0.5; }
+  return s;
+}
+float fbm(vec2 p) { return fbmN(p, 5); }
+</script>
+
+<!--
+  Pass 1: wake field over a world-space window around the boat.
+  The fin's path is a polyline; crust either side of it is shoved away perpendicular to the path.
+  R = intensity (heat / activity), GB = split vector (path normal * amount), A = signed distance to the path.
+-->
+<script id="fs-field" type="x-shader/x-fragment">
+#define MAX_PTS 96
+uniform vec2  uOrg;      // world xz of the window's corner
+uniform float uSize;     // window size (world units)
+uniform float uRes;      // texels across
+uniform float uTime;
+uniform vec4  uPts[MAX_PTS];  // xy: world xz, z: life (heat), w: split amount (world)
+uniform vec4  uAux[MAX_PTS];  // x: reach (world), yz: heading
+uniform int   uCount;         // chronological; the last point is the live fin position
+out vec4 fragColor;
+
+const float SR = 0.4, DR = 2.5;   // encoding ranges: split vector, signed distance
+
+void main() {
+  vec2 p = uOrg + gl_FragCoord.xy / uRes * uSize;
+  float wob = vnoise(p * 1.7 + vec2(uTime * 0.15, 0.0)) - 0.5;
+  vec4 head = uPts[max(uCount - 1, 0)];
+  vec2 headDir = uAux[max(uCount - 1, 0)].yz;
+  float bestScore = -1.0, split = 0.0, sdist = DR, I = 0.0;
+  vec2 nrm = vec2(0.0);
+  for (int i = 0; i < MAX_PTS; i++) {
+    if (i >= uCount) break;
+    bool last = i + 1 >= uCount;
+    vec4 A = uPts[i], Aa = uAux[i];
+    vec4 B = last ? A : uPts[min(i + 1, MAX_PTS - 1)];
+    vec4 Ba = last ? Aa : uAux[min(i + 1, MAX_PTS - 1)];
+    vec2 ab = B.xy - A.xy;
+    float L2 = dot(ab, ab);
+    if (L2 > 1.0) { B = A; Ba = Aa; ab = vec2(0.0); L2 = 0.0; }   // broken trail: never bridge a jump
+    float h = L2 > 1e-8 ? clamp(dot(p - A.xy, ab) / L2, 0.0, 1.0) : 0.0;
+    vec2 dir = L2 > 1e-8 ? ab * inversesqrt(L2) : Aa.yz;
+    vec2 d = p - (A.xy + ab * h);
+    float dist = length(d);
+    float lf = mix(A.z, B.z, h), amt = mix(A.w, B.w, h), R = mix(Aa.x, Ba.x, h);
+    // crust in front of the fin stays (almost) whole: only a short crack runs ahead
+    float aheadF = 1.0;
+    if (i >= uCount - 2) { float ah = max(dot(p - head.xy, headDir), 0.0); aheadF = exp(-ah * ah / 0.2); }
+    float dd = dist * (1.0 + 0.5 * wob);
+    float fall = 1.0 - smoothstep(0.15 * R, R, dd);
+    float s = amt * fall * aheadF;
+    // strongest segment wins; nearest breaks ties where nothing is moving
+    float score = s + 1e-3 * exp(-dist);
+    if (score > bestScore) {
+      bestScore = score; split = s;
+      nrm = vec2(-dir.y, dir.x);
+      sdist = (dot(d, nrm) >= 0.0 ? 1.0 : -1.0) * dist;
+    }
+    I = max(I, lf * (1.0 - smoothstep(0.0, R + 1.2, dd)) * aheadF);
+  }
+  // fade out at the window border so clamped lookups never smear the wake
+  vec2 e2 = min(p - uOrg, uOrg + uSize - p);
+  float bf = smoothstep(0.3, 2.0, min(e2.x, e2.y));
+  I *= bf; split *= bf;
+  fragColor = vec4(I, nrm * split / (2.0 * SR) + 0.5, clamp(sdist, -DR, DR) / (2.0 * DR) + 0.5);
+}
+</script>
+
+<!-- Pass 2: chase camera over an endless crust of rigid plates; raymarched hover boat with a deep fin -->
+<script id="fs" type="x-shader/x-fragment">
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCamPos, uCamR, uCamU, uCamF;
+uniform float uTanH;
+uniform vec3  uBoatPos;
+uniform mat3  uBoatRot;    // boat local (x right, y up, z forward) -> world
+uniform vec2  uFinPos;     // where the fin enters the crust (world xz)
+uniform float uUpGlow;     // how much open magma is near the boat (0..1)
+uniform sampler2D uField;
+uniform vec2  uFieldOrg;
+uniform float uFieldSize;
+out vec4 fragColor;
+
+const float S = 1.4;       // plates per world unit
+const float SR = 0.4, DR = 2.5;
+const float HM = 0.07;     // magma surface sits this far below the crust top (plate thickness)
+const vec3 MOON = vec3(0.30, 0.33, 0.42);
+const vec3 AMB  = vec3(0.075, 0.042, 0.03);
+const vec3 HAZE = vec3(0.30, 0.11, 0.045);
+const vec3 TEAL = vec3(0.22, 0.82, 1.0);
+
+// ---------- field ----------
+vec4 fieldTex(vec2 w) {
+  vec2 uv = (w - uFieldOrg) / uFieldSize;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec4(0.0, 0.5, 0.5, 1.0);
+  return texture(uField, uv);
+}
+vec2 fSplit(vec4 f) { return (f.gb - 0.5) * 2.0 * SR; }
+float fSd(vec4 f) { return (f.a - 0.5) * 2.0 * DR; }
+
+// ---------- crust plates ----------
+// Static warp gives plates jagged outlines. The low-frequency part is linearised (Jacobian) so a plate's
+// outline moves rigidly with it; the small high-frequency raggedness is evaluated in place.
+vec2 warpLow(vec2 u) { return 0.42 * vec2(fbmN(u * 0.57, 4), fbmN(u * 0.57 + 5.2, 4)) - 0.2; }
+vec2 warpHi(vec2 u) {
+  return 0.16 * vec2(fbmN(u * 2.0 + 2.0, 3), fbmN(u * 2.0 + 9.0, 3)) - 0.075
+       + 0.07 * vec2(vnoise(u * 5.7), vnoise(u * 5.7 + 7.0)) - 0.035;
+}
+
+struct Q { float sd1, sd2, sdV1, cut1; vec2 o1, s1; };
+
+// Each plate (or, where the fin's path crosses it, each half of a plate) is its Voronoi cell rigidly
+// translated by the split field sampled at its site. Halves move to opposite sides of the path.
+Q plates(vec2 X, vec2 P, mat2 M, bool live) {
+  vec2 n = floor(X);
+  vec2 site[25];
+  for (int j = -2; j <= 2; j++)
+  for (int i = -2; i <= 2; i++) {
+    vec2 g = n + vec2(float(i), float(j));
+    site[(j + 2) * 5 + (i + 2)] = g + 0.1 + 0.8 * hash2(g);
+  }
+  Q q;
+  q.sd1 = 1e3; q.sd2 = 1e3; q.sdV1 = 1e3; q.cut1 = 0.0; q.o1 = vec2(0.0); q.s1 = vec2(0.0);
+  for (int cj = -1; cj <= 1; cj++)
+  for (int ci = -1; ci <= 1; ci++) {
+    int k = (cj + 2) * 5 + (ci + 2);
+    vec2 sk = site[k];
+    vec2 v = live ? fSplit(fieldTex(sk / S)) : vec2(0.0);
+    bool two = dot(v, v) > 1e-6;
+    for (int s = 0; s < 2; s++) {
+      if (s == 1 && !two) break;
+      float sg = two ? (s == 0 ? 1.0 : -1.0) : 0.0;
+      vec2 off = sg * v;                 // world
+      vec2 Y = X - M * off;              // lattice point before the move
+      float sdv = -1e3;
+      for (int nj = -1; nj <= 1; nj++)
+      for (int ni = -1; ni <= 1; ni++) {
+        if (ni == 0 && nj == 0) continue;
+        vec2 sj = site[k + nj * 5 + ni];
+        sdv = max(sdv, dot(Y - 0.5 * (sk + sj), normalize(sj - sk)));
+      }
+      float sd = sdv, cut = 0.0;
+      if (two) {   // keep only this half: the side of the fin's path it is moving toward
+        // torn, ragged edge; noise in the half's rest coordinates so the edge rides rigidly with it
+        vec2 Pr = P - off;
+        float rag = 0.07 * (fbmN(Pr * 4.5, 2) - 0.37) + 0.025 * (vnoise(Pr * 17.0) - 0.5);
+        float sdc = -sg * (fSd(fieldTex(Pr)) + rag) * S;
+        cut = step(sdv, sdc);
+        sd = max(sdv, sdc);
+      }
+      if (sd < q.sd1) { q.sd2 = q.sd1; q.sd1 = sd; q.o1 = off; q.s1 = sk; q.sdV1 = sdv; q.cut1 = cut; }
+      else if (sd < q.sd2) { q.sd2 = sd; }
+    }
+  }
+  return q;
+}
+
+float voronoiEdgeFree(vec2 x) {   // distance to nearest Voronoi border (IQ), full jitter
+  vec2 n = floor(x), f = fract(x);
+  vec2 mg, mr; float md = 8.0;
+  for (int j = -1; j <= 1; j++)
+  for (int i = -1; i <= 1; i++) {
+    vec2 g = vec2(float(i), float(j));
+    vec2 r = g + hash2(n + g) - f;
+    float d = dot(r, r);
+    if (d < md) { md = d; mr = r; mg = g; }
+  }
+  md = 8.0;
+  for (int j = -2; j <= 2; j++)
+  for (int i = -2; i <= 2; i++) {
+    vec2 g = mg + vec2(float(i), float(j));
+    vec2 r = g + hash2(n + g) - f;
+    if (dot(mr - r, mr - r) > 1e-5) md = min(md, dot(0.5 * (mr + r), normalize(r - mr)));
+  }
+  return md;
+}
+
+float bumpH(vec2 y) { return vnoise(y * 3.1) * 0.6 + vnoise(y * 9.3 + 4.0) * 0.28 + vnoise(y * 26.0 + 9.0) * 0.12; }
+
+// magma ramp: t = 0 gap center (hot) -> 1 gap margin (dark)
+vec3 magmaRamp(float t, float heat) {
+  t = clamp(t + (1.0 - heat) * 0.55, 0.0, 1.0);
+  vec3 c = mix(vec3(1.00, 0.93, 0.62), vec3(1.00, 0.68, 0.16), smoothstep(0.00, 0.22, t));
+  c = mix(c, vec3(0.95, 0.32, 0.03), smoothstep(0.18, 0.48, t));
+  c = mix(c, vec3(0.50, 0.05, 0.01), smoothstep(0.45, 0.78, t));
+  c = mix(c, vec3(0.10, 0.01, 0.00), smoothstep(0.72, 1.00, t));
+  return c;
+}
+
+// ---------- sky ----------
+vec3 sky(vec3 rd) {
+  float h = max(rd.y, 0.0);
+  vec3 c = mix(HAZE * 1.08, vec3(0.035, 0.028, 0.03), smoothstep(0.0, 0.42, h));
+  vec2 sp = rd.xz / (h + 0.12) * 1.1 + vec2(uTime * 0.012, 0.0);
+  float cl = fbm(sp);
+  c = mix(c, c * 0.5 + HAZE * 0.06, smoothstep(0.45, 0.8, cl) * smoothstep(0.0, 0.18, h));
+  return c;
+}
+vec3 fogged(vec3 c, float t) { return mix(c, HAZE, 1.0 - exp(-max(t - 5.0, 0.0) * 0.028)); }
+
+// ---------- boat ----------
+float sdEll(vec3 p, vec3 r) { float k0 = length(p / r), k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / k1; }
+float sdBox(vec3 p, vec3 b) { vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+float sdCap(vec3 p, vec3 a, vec3 b, float r) {
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+
+// mat: 0 hull, 2 canopy, 3 fin
+float boatSDF(vec3 p, out float mat) {
+  float taper = 1.0 - 0.5 * smoothstep(-0.2, 1.3, p.z);          // narrow, pointed bow
+  float hull = sdEll(vec3(p.x / taper, p.y, p.z), vec3(0.46, 0.17, 1.35)) * taper;
+  hull = max(hull, -p.z - 1.12);                                   // flat transom
+  hull = max(hull, p.y - 0.10);                                    // flat deck
+  float pods = sdCap(vec3(abs(p.x), p.y, p.z), vec3(0.43, -0.07, -0.85), vec3(0.43, -0.07, 0.5), 0.09);
+  hull = smin(hull, pods, 0.07);
+  float tail = sdBox(vec3(p.x, p.y - 0.2, p.z + 0.92 + 0.3 * (p.y - 0.1)), vec3(0.018, 0.12, 0.15)) - 0.012;
+  hull = smin(hull, tail, 0.03);
+  float canopy = sdEll(p - vec3(0.0, 0.1, 0.2), vec3(0.19, 0.13, 0.5));
+  // deep swept fin hanging from the stern, thin and tapering to the trailing edge
+  float fy = clamp((-p.y - 0.1) / 1.3, 0.0, 1.0);
+  float zc = -0.78 - 0.5 * fy;
+  float ch = mix(0.32, 0.14, fy);
+  vec3 q = vec3(p.x, p.y + 0.75, p.z - zc);
+  float th = 0.03 * (0.45 + 0.55 * smoothstep(-ch, ch * 0.6, q.z));
+  float fin = sdBox(q, vec3(th, 0.66, ch)) - 0.008;
+  float d = hull; mat = 0.0;
+  if (canopy < d) { d = canopy; mat = 2.0; }
+  if (fin < d) { d = fin; mat = 3.0; }
+  return d;
+}
+float boatMap(vec3 p) { float m; return boatSDF(p, m); }
+vec3 boatNormal(vec3 p) {
+  const vec2 k = vec2(1.0, -1.0);
+  const float e = 0.0015;
+  return normalize(k.xyy * boatMap(p + k.xyy * e) + k.yyx * boatMap(p + k.yyx * e)
+                 + k.yxy * boatMap(p + k.yxy * e) + k.xxx * boatMap(p + k.xxx * e));
+}
+// returns 1 on hit; on a near miss, tNear/dNear describe the closest approach (for edge antialiasing)
+bool traceBoat(vec3 ro, vec3 rd, mat3 invR, out float t, out float tNear, out float dNear) {
+  t = 1e9; tNear = 1e9; dNear = 1e9;
+  vec3 C = uBoatPos + uBoatRot * vec3(0.0, -0.45, -0.15);
+  vec3 oc = ro - C;
+  float b = dot(oc, rd), c = dot(oc, oc) - 1.95 * 1.95, h = b * b - c;
+  if (h < 0.0) return false;
+  h = sqrt(h);
+  float tt = max(-b - h, 0.0), tmax = -b + h;
+  vec3 lro = invR * (ro - uBoatPos), lrd = invR * rd;
+  for (int i = 0; i < 96; i++) {
+    float d = boatMap(lro + lrd * tt);
+    if (d < dNear) { dNear = d; tNear = tt; }
+    if (d < 0.0006 * tt) { t = tt; return true; }
+    tt += d * 0.72;
+    if (tt > tmax) break;
+  }
+  return false;
+}
+vec3 shadeBoat(vec3 pw, vec3 rd, mat3 invR, vec3 L) {
+  vec3 lp = invR * (pw - uBoatPos);
+  float mat; boatSDF(lp, mat);
+  vec3 nl = boatNormal(lp);
+  vec3 n = uBoatRot * nl;
+  float ndv = max(dot(n, -rd), 0.0);
+  float fres = pow(1.0 - ndv, 4.0);
+  vec3 base = vec3(0.15, 0.155, 0.17);
+  float spP = 56.0, spK = 0.7, refl = 0.55;
+  vec3 em = vec3(0.0);
+  if (mat > 1.5 && mat < 2.5) {          // dark glass canopy with a faint amber cabin glow
+    base = vec3(0.012, 0.014, 0.018); spP = 140.0; spK = 1.1; refl = 1.0;
+    em += vec3(0.5, 0.22, 0.06) * 0.12 * (1.0 - smoothstep(-0.2, 0.4, nl.y));
+  } else if (mat < 0.5) {
+    float stripe = 1.0 - smoothstep(0.004, 0.011, abs(lp.y - 0.02 - 0.03 * lp.z));
+    base = mix(base, vec3(0.42, 0.39, 0.34), stripe * step(-1.0, lp.z));
+  }
+  float diff = max(dot(n, L), 0.0);
+  float sp = pow(max(dot(n, normalize(L - rd)), 0.0), spP) * spK;
+  float up = max(-n.y, 0.0);
+  vec3 magL = vec3(1.0, 0.36, 0.08) * (0.18 + 1.3 * uUpGlow) * (0.2 + 0.8 * up);
+  float dF = length(pw.xz - uFinPos);
+  magL += vec3(1.0, 0.45, 0.1) * exp(-dF * dF / 0.3) * (1.0 - smoothstep(0.0, 0.8, pw.y)) * 1.1;
+  vec3 col = base * (MOON * diff + AMB * 1.6 + magL) + MOON * sp;
+  vec3 rdir = reflect(rd, n);
+  vec3 env = rdir.y > 0.0 ? sky(rdir) : vec3(0.26, 0.07, 0.02) * (0.4 + uUpGlow);
+  col += env * fres * refl;
+  // antigravity emitters along the underside of the pods
+  float pod = 1.0 - smoothstep(0.08, 0.16, length(vec2(abs(lp.x) - 0.43, lp.y + 0.07)));
+  pod *= smoothstep(0.05, -0.6, nl.y) * step(lp.z, 0.55) * step(-0.9, lp.z);
+  em += TEAL * pod * (2.2 + 0.3 * sin(uTime * 9.0 + lp.z * 6.0));
+  // fin: heated where it meets the magma
+  if (mat > 2.5) {
+    float hot = 1.0 - smoothstep(-0.05, 0.32, pw.y);
+    em += magmaRamp(1.0 - 0.9 * hot, 1.0) * hot * 1.1;
+  }
+  return col + em;
+}
+
+// ---------- crust shading ----------
+vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hitB, float tb) {
+  vec3 P = ro + rd * tp;
+  float sinG = max(-rd.y, 1e-3);
+  float pxW = tp * pixAng * 0.5 * (1.0 + 1.0 / max(sinG, 0.1));   // pixel footprint on the crust
+  float pxL = pxW * S;
+  float lod = smoothstep(0.14, 0.4, pxL);
+  vec4 F0 = fieldTex(P.xz);
+  float I = F0.r;
+  float heat = smoothstep(0.05, 0.7, I);
+
+  // boat light on the crust: soft moon shadow, teal hover pool, glow where the fin cuts in
+  vec3 ps = P + L * ((uBoatPos.y - P.y) / L.y);
+  vec3 lbs = invR * (ps - uBoatPos);
+  float vis = 1.0 - 0.75 * exp(-(lbs.x * lbs.x / 0.2 + lbs.z * lbs.z / 1.4));
+  vec3 lb = invR * (P - uBoatPos);
+  float pool = exp(-(pow(abs(lb.x) - 0.43, 2.0) / 0.09 + pow(lb.z + 0.15, 2.0) / 0.9)) * 0.85
+             + exp(-(lb.x * lb.x / 0.7 + lb.z * lb.z / 2.2)) * 0.22;
+  vec2 dfp = P.xz - uFinPos;
+  vec3 addL = TEAL * pool * 1.5 * (0.9 + 0.1 * sin(uTime * 9.0)) + vec3(1.0, 0.42, 0.08) * exp(-dot(dfp, dfp) / 0.12) * 0.8;
+
+  vec3 avgRock = vec3(0.075, 0.062, 0.054) * (MOON * 0.6 * vis + AMB + addL);
+  float vS = length(fSplit(F0));
+  vec3 avg = mix(avgRock + vec3(0.045, 0.007, 0.0), magmaRamp(0.35, heat), clamp(vS * S * 0.9, 0.0, 0.6));
+  if (lod >= 1.0) return avg;
+
+  vec2 u = P.xz * S;
+  vec2 Wl = warpLow(u);
+  const float e = 0.05;
+  vec2 Jx = (warpLow(u + vec2(e, 0.0)) - Wl) / e, Jy = (warpLow(u + vec2(0.0, e)) - Wl) / e;
+  mat2 M = S * mat2(vec2(1.0, 0.0) + Jx, vec2(0.0, 1.0) + Jy);   // d(lattice)/d(world)
+  vec2 X = u + Wl + warpHi(u);
+  bool live = I > 0.004;
+  Q q = plates(X, P.xz, M, live);
+  float G = max(q.sd1 + max(q.sd2, 0.0), 1e-5);   // local gap width (lattice)
+  float cover = 1.0 - smoothstep(-pxL, pxL, q.sd1);
+
+  // --- rock surface, textured in plate-local coordinates so it rides with the plate
+  vec2 Yl = X - M * q.o1;
+  float tone = hash1(floor(q.s1) + 17.0);
+  float hb = bumpH(Yl), hx = bumpH(Yl + vec2(0.02, 0.0)), hz = bumpH(Yl + vec2(0.0, 0.02));
+  vec3 nr = normalize(vec3(-(hx - hb) / 0.02 * 0.16, 1.0, -(hz - hb) / 0.02 * 0.16));
+  vec3 alb = vec3(0.08, 0.068, 0.06) * (0.6 + 0.8 * tone) * (0.72 + 0.56 * hb);
+  float diff = max(dot(nr, L), 0.0);
+  float spec = pow(max(dot(nr, normalize(L - rd)), 0.0), 30.0) * 0.14;
+  vec3 rock = alb * (MOON * diff * vis + AMB + addL) + MOON * spec * vis;
+
+  // cooled seams between resting plates: thin, dim, some almost dark
+  float dV = max(-q.sdV1, 0.0) / S;
+  float ws = 0.009 + 0.013 * vnoise(X * 1.7);
+  float sb = (0.04 + 0.96 * smoothstep(0.45, 0.85, vnoise(X * 0.8 + 3.0))) * (0.85 + 0.15 * sin(uTime * 1.1 + 6.28 * tone));
+  float seam = (1.0 - smoothstep(ws - pxW, ws + pxW, dV)) * min(1.0, ws / pxW);
+  rock = mix(rock, vec3(0.36, 0.06, 0.01) * sb * (0.55 + 0.45 * clamp(1.0 - dV / ws, 0.0, 1.0)), seam);
+  rock += vec3(0.10, 0.025, 0.004) * sb * exp(-dV / 0.045) * 0.4;
+
+  // heat glow beside real gaps
+  float dE = max(-q.sd1, 0.0) / S;
+  rock += vec3(0.55, 0.13, 0.02) * exp(-dE / 0.045) * heat * smoothstep(0.0, 0.06 * S, G);
+
+  // hairline fractures in hot plates
+  if (I > 0.62) {
+    float eh = voronoiEdgeFree(Yl * 2.4 + 3.3) / 2.4;
+    float wh = smoothstep(0.62, 1.0, I) * 0.026 * (0.4 + vnoise(Yl * 6.0)) * smoothstep(0.42, 0.62, vnoise(Yl * 3.0 + 1.7));
+    float hm = (1.0 - smoothstep(wh - pxL, wh + pxL, eh)) * smoothstep(0.5 * pxL, 1.5 * pxL, wh);
+    hm *= smoothstep(0.0, 3.0 * pxL, -q.sd1);
+    rock = mix(rock, magmaRamp(0.35 + 0.65 * pow(eh / max(wh, 1e-4), 0.6), heat * 0.8), hm);
+  }
+
+  // surface crack band along hot boundaries (incl. the short crack running ahead of the fin)
+  float bw = smoothstep(0.45, 0.95, I) * 0.02 * S * (0.6 + 0.8 * vnoise(X * 5.0)) * smoothstep(0.3, 0.6, vnoise(X * 2.0 + 4.1));
+  float hw = 0.5 * G + bw;
+  float dc = abs(q.sd1 - 0.5 * G);
+  float band = (1.0 - smoothstep(hw - pxL, hw + pxL, dc)) * smoothstep(0.5 * pxL, 1.5 * pxL, hw);
+  vec3 rockSide = mix(rock, magmaRamp(dc / max(hw, 1e-4), heat), band);
+  vec3 det = rockSide;
+
+  // --- inside a gap: look down to the magma level; the far plate's wall shows above it
+  if (q.sd1 > -pxL) {
+    float tm = tp + HM / sinG;
+    vec3 P1 = ro + rd * tm;
+    vec2 X1 = X + M * (P1.xz - P.xz);
+    Q q1 = plates(X1, P1.xz, M, live);
+    vec3 gapC;
+    if (q1.sd1 > 0.0) {
+      float G1 = max(q1.sd1 + max(q1.sd2, 0.0), 1e-5);
+      float t1 = abs(q1.sd1 - 0.5 * G1) / (0.5 * G1);
+      float gheat = heat * mix(0.75, 1.0, smoothstep(0.0, 0.1 * S, G1));
+      float flow = fbm(P1.xz * 2.5 + vec2(uTime * 0.25, -uTime * 0.4));
+      gapC = magmaRamp(t1, gheat) * (0.78 + 0.45 * flow) + addL * 0.12;
+    } else {
+      float f = clamp(q.sd1 / max(q.sd1 - q1.sd1, 1e-4), 0.0, 1.0);   // how deep the ray meets the wall
+      gapC = mix(vec3(0.022, 0.013, 0.01), magmaRamp(0.62, heat) * 0.75, pow(f, 1.6));
+    }
+    if (hitB && tb < tm) gapC = shadeBoat(ro + rd * tb, rd, invR, L);   // the fin, seen down the slot
+    det = mix(gapC, rockSide, cover);
+  }
+  return mix(det, avg, lod);
+}
+
+void main() {
+  vec2 ndc = (gl_FragCoord.xy * 2.0 - uRes) / uRes.y;
+  vec3 rd = normalize(uCamR * ndc.x * uTanH + uCamU * ndc.y * uTanH + uCamF);
+  vec3 ro = uCamPos;
+  vec3 L = normalize(vec3(-0.45, 0.62, 0.65));
+  float pixAng = 2.0 * uTanH / uRes.y;
+  mat3 invR = transpose(uBoatRot);
+
+  float tb, tNear, dNear;
+  bool hitB = traceBoat(ro, rd, invR, tb, tNear, dNear);
+  float tp = rd.y < -1e-4 ? -ro.y / rd.y : 1e9;
+
+  // boat coverage with a one-pixel soft edge
+  float aB = 0.0, tB = 1e9;
+  if (hitB && tb < tp) { aB = 1.0; tB = tb; }
+  else if (!hitB && tNear < tp) { aB = 1.0 - smoothstep(0.0, tNear * pixAng, dNear); tB = tNear; }
+
+  vec3 col = vec3(0.0);
+  if (aB < 1.0) {
+    if (tp > 1e8) col = sky(rd);
+    else col = fogged(crust(ro, rd, tp, invR, L, pixAng, hitB, tb), tp);
+  }
+  if (aB > 0.0) col = mix(col, fogged(shadeBoat(ro + rd * tB, rd, invR, L), tB), aB);
+
+  col += (hash1(gl_FragCoord.xy) - 0.5) / 255.0;   // dither the dark gradients
+  fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(0.92)), 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const MAX_PTS = 96;
+  const FIELD_RES = 256, FIELD_SIZE = 32;     // world window around the boat, texel = 0.125
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+  if (!gl) { document.getElementById('err').style.display = 'grid'; return; }
+
+  const src = id => document.getElementById(id).textContent;
+  const fragSrc = id => '#version 300 es\nprecision highp float;\nprecision highp int;\n' + src('common') + src(id);
+  function compile(type, s) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, s.trim());
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  }
+  function program(fs, names) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, src('vs')));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'aPos');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const U = {};
+    for (const n of names) U[n] = gl.getUniformLocation(p, n);
+    return { p, U };
+  }
+  const fieldProg = program(fragSrc('fs-field'), ['uOrg', 'uSize', 'uRes', 'uTime', 'uPts', 'uAux', 'uCount']);
+  const mainProg = program(fragSrc('fs'), ['uRes', 'uTime', 'uCamPos', 'uCamR', 'uCamU', 'uCamF', 'uTanH',
+    'uBoatPos', 'uBoatRot', 'uFinPos', 'uUpGlow', 'uField', 'uFieldOrg', 'uFieldSize']);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  // field render target: half float when renderable (precise cut lines), else RGBA8
+  const fieldTex = gl.createTexture();
+  const fbo = gl.createFramebuffer();
+  function makeField(useHalf) {
+    gl.bindTexture(gl.TEXTURE_2D, fieldTex);
+    if (useHalf) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, FIELD_RES, FIELD_RES, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, FIELD_RES, FIELD_RES, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fieldTex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return ok;
+  }
+  const canHalf = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+  if (!(canHalf && makeField(true))) makeField(false);
+
+  // ---------- layout (adaptive resolution: the scene shader is heavy) ----------
+  let W = 0, H = 0, scale = 1, maxScale = 1;
+  function applySize() {
+    canvas.width = Math.max(1, Math.round(W * scale));
+    canvas.height = Math.max(1, Math.round(H * scale));
+  }
+  function resize() {
+    W = innerWidth; H = innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    maxScale = Math.min(dpr, Math.sqrt(2.0e6 / (W * H)));
+    scale = Math.min(scale, maxScale) || maxScale;
+    applySize();
+  }
+  addEventListener('resize', resize);
+  scale = 10; resize();
+
+  // ---------- small vector helpers ----------
+  const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const smooth = x => { x = Math.min(Math.max(x, 0), 1); return x * x * (3 - 2 * x); };
+  const wrapA = a => Math.atan2(Math.sin(a), Math.cos(a));
+  function mul3(A, B) {
+    const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+    return C;
+  }
+
+  // ---------- camera: fixed orientation, follows the boat (steering by pointing stays intuitive) ----------
+  const TANH = Math.tan(25 * Math.PI / 180);
+  const CAM_OFF = [0, 3.9, -5.6], LOOK_AHEAD = 1.4;
+  const cam = { fx: 0, fz: 0, pos: [0, 0, 0], R: [1, 0, 0], U: [0, 1, 0], F: [0, 0, 1] };
+  function updateCamera() {
+    cam.pos = [cam.fx + CAM_OFF[0], CAM_OFF[1], cam.fz + CAM_OFF[2]];
+    cam.F = norm([cam.fx - cam.pos[0], -cam.pos[1], cam.fz + LOOK_AHEAD - cam.pos[2]]);
+    cam.R = norm(cross([0, 1, 0], cam.F));
+    cam.U = cross(cam.F, cam.R);
+  }
+  function rayDir(px, py) {
+    const x = (2 * px - W) / H * TANH, y = (H - 2 * py) / H * TANH;
+    return norm([cam.R[0] * x + cam.U[0] * y + cam.F[0], cam.R[1] * x + cam.U[1] * y + cam.F[1], cam.R[2] * x + cam.U[2] * y + cam.F[2]]);
+  }
+  function onPlane(px, py) {
+    const d = rayDir(px, py);
+    const dy = Math.min(d[1], -0.04);
+    const t = Math.min(-cam.pos[1] / dy, 45);
+    return [cam.pos[0] + d[0] * t, cam.pos[2] + d[2] * t];
+  }
+  function screenX01(x, y, z) {   // for stereo panning
+    const r = [x - cam.pos[0], y - cam.pos[1], z - cam.pos[2]];
+    const ndc = dot3(r, cam.R) / (Math.max(dot3(r, cam.F), 0.1) * TANH);
+    return Math.min(Math.max(0.5 + ndc * H / (2 * W), 0), 1);
+  }
+
+  // ---------- sound (Web Audio, fully synthesized) ----------
+  const Sound = (() => {
+    let ctx = null, master, on = false;
+    let rumbleG, hissG, sizzleG, sizzleF, whooshG, humG, humA, humB, white, brown;
+    let lastCrack = 0, lastCrunch = 0, lastGloop = 0, susTimer = 0;
+    function noise(kind) {
+      const len = ctx.sampleRate * 2, b = ctx.createBuffer(1, len, ctx.sampleRate), d = b.getChannelData(0);
+      let last = 0;
+      for (let i = 0; i < len; i++) {
+        const w = Math.random() * 2 - 1;
+        if (kind === 'brown') { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w;
+      }
+      if (kind === 'brown') { const e = d[len - 1] - d[0]; for (let i = 0; i < len; i++) d[i] -= e * i / (len - 1); }
+      return b;
+    }
+    function loop(buf) { const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true; s.start(0, Math.random() * buf.duration); return s; }
+    function filt(type, f, q = 0.7) { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; b.Q.value = q; return b; }
+    function out(pan) { const p = ctx.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, pan)); p.connect(master); return p; }
+    function env(g, t, a, peak, d) {
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + a);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+    }
+    function gainNode(v = 0) { const g = ctx.createGain(); g.gain.value = v; g.connect(master); return g; }
+    function init() {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = ctx.createGain(); master.gain.value = 0;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -16; comp.ratio.value = 4;
+      master.connect(comp).connect(ctx.destination);
+      white = noise('white'); brown = noise('brown');
+      // magma rumble, swelling with how much of the wake is open
+      rumbleG = gainNode();
+      loop(brown).connect(filt('lowpass', 140)).connect(rumbleG);
+      // cooling hiss while the wake glues back
+      hissG = gainNode();
+      loop(white).connect(filt('highpass', 3800)).connect(filt('lowpass', 9000)).connect(hissG);
+      // the fin slicing through magma: a band of sizzle that brightens with speed
+      sizzleG = gainNode(); sizzleF = filt('bandpass', 1800, 0.9);
+      loop(white).connect(sizzleF).connect(sizzleG);
+      // air rushing past the hull
+      whooshG = gainNode();
+      loop(brown).connect(filt('bandpass', 420, 0.6)).connect(whooshG);
+      // antigravity hum: two detuned tones a fifth apart with a slow beat, rising with speed
+      humG = gainNode();
+      const humF = filt('lowpass', 520, 0.8); humF.connect(humG);
+      humA = ctx.createOscillator(); humA.type = 'sine'; humA.frequency.value = 58;
+      humB = ctx.createOscillator(); humB.type = 'triangle'; humB.frequency.value = 87.4;
+      const gA = ctx.createGain(); gA.gain.value = 0.7; const gB = ctx.createGain(); gB.gain.value = 0.35;
+      humA.connect(gA).connect(humF); humB.connect(gB).connect(humF);
+      const trem = ctx.createOscillator(); trem.frequency.value = 3.2;
+      const tremG = ctx.createGain(); tremG.gain.value = 0.18; trem.connect(tremG).connect(gB.gain);
+      humA.start(); humB.start(); trem.start();
+    }
+    // sharp stone crackle: a cluster of tiny band-passed noise ticks
+    function crackle(x, strength) {
+      if (!on) return;
+      const t0 = ctx.currentTime;
+      if (t0 - lastCrack < 0.035) return;
+      lastCrack = t0;
+      const o = out((x - 0.5) * 1.4);
+      const count = 2 + Math.floor(strength * 6 * Math.random());
+      for (let i = 0; i < count; i++) {
+        const t = t0 + (i ? Math.random() * 0.14 : 0);
+        const s = ctx.createBufferSource(); s.buffer = white;
+        const g = ctx.createGain();
+        const bp = filt('bandpass', 1400 + Math.random() * 5200, 2 + Math.random() * 7);
+        s.connect(bp).connect(g).connect(o);
+        const dur = 0.004 + Math.random() * 0.03;
+        env(g, t, 0.001, (0.12 + 0.4 * Math.random()) * strength, dur);
+        s.start(t, Math.random() * 1.5, dur + 0.02);
+      }
+    }
+    // deep crunch for a bigger break
+    function crunch(x, strength) {
+      if (!on) return;
+      if (ctx.currentTime - lastCrunch < 0.09) return crackle(x, strength);
+      lastCrunch = ctx.currentTime;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.2);
+      const s = ctx.createBufferSource(); s.buffer = white;
+      const g = ctx.createGain();
+      s.connect(filt('lowpass', 520, 1.2)).connect(g).connect(o);
+      env(g, t, 0.003, 0.55 * strength, 0.12);
+      s.start(t, Math.random() * 1.5, 0.2);
+      const th = ctx.createOscillator(), tg = ctx.createGain();
+      th.frequency.setValueAtTime(95, t); th.frequency.exponentialRampToValueAtTime(38, t + 0.14);
+      th.connect(tg).connect(o); env(tg, t, 0.004, 0.35 * strength, 0.16);
+      th.start(t); th.stop(t + 0.25);
+      crackle(x, strength);
+    }
+    function bubble(x) {
+      if (!on) return;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.4);
+      const f0 = 120 + Math.random() * 240;
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.frequency.setValueAtTime(f0, t);
+      osc.frequency.exponentialRampToValueAtTime(f0 * 0.45, t + 0.1);
+      osc.connect(filt('lowpass', 900)).connect(g).connect(o);
+      env(g, t, 0.006, 0.07 + Math.random() * 0.07, 0.11);
+      osc.start(t); osc.stop(t + 0.2);
+    }
+    function gloop(x) {
+      if (!on) return;
+      if (ctx.currentTime - lastGloop < 0.08) return;
+      lastGloop = ctx.currentTime;
+      const t = ctx.currentTime + Math.random() * 0.05, o = out((x - 0.5) * 1.4);
+      const osc = ctx.createOscillator(), g = ctx.createGain(), lp = filt('lowpass', 1400, 3);
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(210 + Math.random() * 60, t);
+      osc.frequency.exponentialRampToValueAtTime(80, t + 0.2);
+      lp.frequency.setValueAtTime(1400, t); lp.frequency.exponentialRampToValueAtTime(260, t + 0.22);
+      osc.connect(lp).connect(g).connect(o);
+      env(g, t, 0.012, 0.08, 0.22);
+      osc.start(t); osc.stop(t + 0.3);
+    }
+    function update(m, dt) {
+      if (!on) return;
+      const t = ctx.currentTime, sp = Math.min(1, m.speed / 6);
+      rumbleG.gain.setTargetAtTime(Math.min(1, m.open * 0.5) * 0.5, t, 0.25);
+      hissG.gain.setTargetAtTime(Math.min(1, m.healing * 0.08) * 0.05, t, 0.15);
+      sizzleG.gain.setTargetAtTime(0.012 + sp * 0.07, t, 0.1);
+      sizzleF.frequency.setTargetAtTime(1500 + sp * 2600, t, 0.15);
+      whooshG.gain.setTargetAtTime(sp * sp * 0.32, t, 0.15);
+      humG.gain.setTargetAtTime(0.16 + sp * 0.06, t, 0.2);
+      humA.frequency.setTargetAtTime(58 + sp * 14 + m.turn * 4, t, 0.25);
+      humB.frequency.setTargetAtTime(87.4 + sp * 21 + m.turn * 6, t, 0.25);
+      if (Math.random() < Math.min(m.open, 6) * 0.6 * dt) bubble(m.x);
+    }
+    function setOn(v) {
+      if (!ctx) init();
+      on = v;
+      const t = ctx.currentTime;
+      clearTimeout(susTimer);
+      if (on) ctx.resume();
+      else {
+        for (const g of [rumbleG, hissG, sizzleG, whooshG, humG]) { g.gain.cancelScheduledValues(t); g.gain.setTargetAtTime(0, t, 0.05); }
+        susTimer = setTimeout(() => { if (!on) ctx.suspend(); }, 400);
+      }
+      master.gain.setTargetAtTime(on ? 0.9 : 0, t, 0.05);
+    }
+    const safe = fn => (...a) => { try { return fn(...a); } catch (e) { on = false; console.warn('sound disabled:', e); } };
+    return { crackle: safe(crackle), crunch: safe(crunch), gloop: safe(gloop), update: safe(update),
+             setOn, get on() { return on; } };
+  })();
+
+  const sndBtn = document.getElementById('snd');
+  function toggleSound() {
+    Sound.setOn(!Sound.on);
+    sndBtn.textContent = Sound.on ? 'Sound on' : 'Sound off · click to enable';
+    sndBtn.classList.toggle('on', Sound.on);
+    sndBtn.setAttribute('aria-pressed', String(Sound.on));
+  }
+  sndBtn.addEventListener('click', toggleSound);
+  addEventListener('keydown', e => {
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'm' || e.key === 'M') toggleSound();
+  });
+
+  // ---------- pointer ----------
+  const ptr = { x: 0, y: 0, active: false };
+  const hint = document.getElementById('hint');
+  function onMove(e) {
+    ptr.x = e.clientX; ptr.y = e.clientY; ptr.active = true;
+    if (!hint.classList.contains('gone')) setTimeout(() => hint.classList.add('gone'), 2500);
+  }
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerdown', onMove);
+  canvas.addEventListener('pointerup', e => { if (e.pointerType === 'touch') ptr.active = false; });
+  canvas.addEventListener('pointerleave', () => { ptr.active = false; });
+  canvas.addEventListener('pointercancel', () => { ptr.active = false; });
+
+  // ---------- boat ----------
+  const MAXV = 6.2;
+  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.58 };
+  const FIN_LOCAL = [0, -0.58, -0.96];   // where the swept fin crosses the crust (boat local)
+  let boatRotCols = new Float32Array(9), boatRows = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  function updateBoat(dt, t) {
+    let wantRate = 0, throttle = 0;
+    if (ptr.active) {
+      const T = onPlane(ptr.x, ptr.y);
+      const dx = T[0] - boat.x, dz = T[1] - boat.z, dist = Math.hypot(dx, dz);
+      if (dist > 0.9) {
+        const err = wrapA(Math.atan2(dx, dz) - boat.yaw);
+        const turnMax = 1.0 + 1.2 * Math.min(1, boat.v / 3);
+        wantRate = Math.max(-turnMax, Math.min(turnMax, err * 2.4));
+        throttle = Math.min(1, (dist - 0.9) / 5.5) * Math.pow(Math.max(0, Math.cos(err)), 1.5);
+      }
+    }
+    boat.yawRate += (wantRate - boat.yawRate) * (1 - Math.exp(-dt * 5));
+    boat.yaw = wrapA(boat.yaw + boat.yawRate * dt);
+    const vT = MAXV * throttle, v0 = boat.v;
+    boat.v += (vT - boat.v) * (1 - Math.exp(-dt * (vT > boat.v ? 1.1 : 0.8)));
+    boat.x += Math.sin(boat.yaw) * boat.v * dt;
+    boat.z += Math.cos(boat.yaw) * boat.v * dt;
+    const acc = (boat.v - v0) / Math.max(dt, 1e-3);
+    const rollT = Math.max(-0.35, Math.min(0.35, -boat.yawRate * (0.12 + boat.v * 0.06)));
+    boat.roll += (rollT - boat.roll) * (1 - Math.exp(-dt * 4));
+    const pitchT = Math.max(-0.06, Math.min(0.09, acc * 0.03)) + 0.012 * Math.sin(t * 1.3);
+    boat.pitch += (pitchT - boat.pitch) * (1 - Math.exp(-dt * 3));
+    boat.y = 0.58 + 0.035 * Math.sin(t * 1.6) + 0.018 * Math.sin(t * 2.7 + 1.0);
+    const cy = Math.cos(boat.yaw), sy = Math.sin(boat.yaw), cp = Math.cos(boat.pitch), spp = Math.sin(boat.pitch);
+    const cr = Math.cos(boat.roll), sr = Math.sin(boat.roll);
+    boatRows = mul3(mul3([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], [[1, 0, 0], [0, cp, spp], [0, -spp, cp]]), [[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]]);
+    const M = boatRows;
+    boatRotCols = new Float32Array([M[0][0], M[1][0], M[2][0], M[0][1], M[1][1], M[2][1], M[0][2], M[1][2], M[2][2]]);
+    return Math.abs(boat.yawRate);
+  }
+  function finWorld() {
+    const M = boatRows, l = FIN_LOCAL;
+    return [boat.x + M[0][0] * l[0] + M[0][1] * l[1] + M[0][2] * l[2],
+            boat.z + M[2][0] * l[0] + M[2][1] * l[1] + M[2][2] * l[2]];
+  }
+
+  // ---------- wake: chronological points dropped by the fin ----------
+  // Each point: the crust splits open behind the fin, widens, holds hot, then glues back without a trace.
+  const OPEN = 0.8, HOLD = 0.9, HEAL = 1.8, LIFESPAN = HOLD + HEAL;
+  const A0 = 0.05, AMAX = 0.32;
+  const pts = [];   // {x, z, born, hx, hz, k, sealed}
+  const lifeOf = age => age < HOLD ? 1 : 1 - smooth((age - HOLD) / HEAL);
+  const amtOf = (age, k) => (A0 + (AMAX - A0) * k * smooth(age / OPEN)) * lifeOf(age);
+  const reachOf = age => 0.75 + 0.85 * smooth(age / 1.2);
+
+  // ---------- render loop ----------
+  const ptsArr = new Float32Array(MAX_PTS * 4);
+  const auxArr = new Float32Array(MAX_PTS * 4);
+  const nowS = () => performance.now() / 1000;
+  const t0 = nowS();
+  let lastFrame = t0, perfAcc = 0, perfN = 0, perfT = t0;
+  cam.fx = boat.x; cam.fz = boat.z;
+
+  function frame() {
+    const now = nowS();
+    const dt = Math.min(now - lastFrame, 0.1);
+    lastFrame = now;
+    const t = now - t0;
+
+    // adaptive resolution: keep the frame time near 60 fps
+    perfAcc += dt; perfN++;
+    if (now - perfT > 1.0) {
+      const avg = perfAcc / perfN;
+      if (avg > 1 / 42 && scale > 0.45) { scale *= 0.85; applySize(); }
+      else if (avg < 1 / 57 && scale < maxScale) { scale = Math.min(maxScale, scale * 1.08); applySize(); }
+      perfAcc = 0; perfN = 0; perfT = now;
+    }
+
+    const turn = updateBoat(dt, t);
+    const hx = Math.sin(boat.yaw), hz = Math.cos(boat.yaw);
+    const k = 1 - Math.exp(-dt * 2.2);
+    cam.fx += (boat.x + hx * boat.v * 0.35 - cam.fx) * k;
+    cam.fz += (boat.z + hz * boat.v * 0.35 - cam.fz) * k;
+    updateCamera();
+
+    // drop wake points behind the fin; spacing grows with speed so the buffer spans a full lifespan
+    const [fx, fz] = finWorld();
+    const pan = screenX01(fx, 0, fz);
+    const step = Math.max(0.16, boat.v * LIFESPAN / (MAX_PTS - 8));
+    const lastP = pts[pts.length - 1];
+    if (!lastP || Math.hypot(fx - lastP.x, fz - lastP.z) > step) {
+      pts.push({ x: fx, z: fz, born: now, hx, hz, k: 0.55 + 0.45 * Math.min(1, boat.v / 3), sealed: false });
+      if (boat.v > 4.2 && Math.random() < 0.12) Sound.crunch(pan, 0.7);
+      else Sound.crackle(pan, Math.min(1, 0.35 + boat.v * 0.12));
+    }
+    while (pts.length && (now - pts[0].born > LIFESPAN || pts.length > MAX_PTS - 1)) pts.shift();
+
+    const m = { open: 0, healing: 0, speed: boat.v, turn: Math.min(1, turn), x: pan };
+    let n = 0, near = 0;
+    for (const p of pts) {
+      const age = now - p.born;
+      const l = lifeOf(age), a = amtOf(age, p.k);
+      m.open += a * 4;
+      if (age > HOLD) m.healing += l;
+      if (!p.sealed && age > HOLD + 0.1) { p.sealed = true; if (Math.random() < 0.06) Sound.gloop(screenX01(p.x, 0, p.z)); }
+      const d2 = (p.x - boat.x) ** 2 + (p.z - boat.z) ** 2;
+      near += a * l * Math.exp(-d2 / 5);
+      ptsArr.set([p.x, p.z, l, a], n * 4);
+      auxArr.set([reachOf(age), p.hx, p.hz, 0], n * 4);
+      n++;
+    }
+    // live head at the fin: the slot is always open where the blade is
+    ptsArr.set([fx, fz, 1, A0], n * 4);
+    auxArr.set([reachOf(0), hx, hz, 0], n * 4);
+    n++;
+    m.open /= Math.max(1, pts.length * 0.25);
+    Sound.update(m, dt);
+
+    // pass 1: wake field (window snapped to texels so plate offsets never shimmer)
+    const texel = FIELD_SIZE / FIELD_RES;
+    const ox = Math.floor((cam.fx - FIELD_SIZE / 2) / texel) * texel;
+    const oz = Math.floor((cam.fz + 4 - FIELD_SIZE / 2) / texel) * texel;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, FIELD_RES, FIELD_RES);
+    gl.useProgram(fieldProg.p);
+    gl.uniform2f(fieldProg.U.uOrg, ox, oz);
+    gl.uniform1f(fieldProg.U.uSize, FIELD_SIZE);
+    gl.uniform1f(fieldProg.U.uRes, FIELD_RES);
+    gl.uniform1f(fieldProg.U.uTime, t);
+    gl.uniform4fv(fieldProg.U.uPts, ptsArr);
+    gl.uniform4fv(fieldProg.U.uAux, auxArr);
+    gl.uniform1i(fieldProg.U.uCount, n);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // pass 2: scene
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(mainProg.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fieldTex);
+    const U = mainProg.U;
+    gl.uniform1i(U.uField, 0);
+    gl.uniform2f(U.uFieldOrg, ox, oz);
+    gl.uniform1f(U.uFieldSize, FIELD_SIZE);
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, t);
+    gl.uniform3fv(U.uCamPos, cam.pos);
+    gl.uniform3fv(U.uCamR, cam.R);
+    gl.uniform3fv(U.uCamU, cam.U);
+    gl.uniform3fv(U.uCamF, cam.F);
+    gl.uniform1f(U.uTanH, TANH);
+    gl.uniform3f(U.uBoatPos, boat.x, boat.y, boat.z);
+    gl.uniformMatrix3fv(U.uBoatRot, false, boatRotCols);
+    gl.uniform2f(U.uFinPos, fx, fz);
+    gl.uniform1f(U.uUpGlow, Math.min(1, near * 2.5));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    schedule();
+  }
+  const schedule = () => document.hidden ? setTimeout(frame, 33) : requestAnimationFrame(frame);
+  schedule();
+})();
+</script>
+</body>
+</html>

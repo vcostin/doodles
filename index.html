@@ -36,6 +36,21 @@
       linear-gradient(-28deg, transparent 47.5%, #b82a04 49.3%, #ffb43c 50%, #b82a04 50.7%, transparent 52.5%);
     background-size: 60% 60%, 55% 55%; background-position: 40% 45%, 70% 60%; background-repeat: no-repeat;
   }
+  .thumb.boat {
+    position: relative; overflow: hidden;
+    background:
+      linear-gradient(180deg, #3d1a0b 0, #1c120c 38%, #120c08 100%);
+  }
+  .thumb.boat::before {   /* the wake: a magma seam running back from the fin */
+    content: ""; position: absolute; left: -10%; top: 58%; width: 62%; height: 7px; transform: rotate(-9deg);
+    background: linear-gradient(90deg, transparent 0, #b82a04 18%, #ffb43c 60%, #ffe08a 100%);
+    border-radius: 4px; filter: blur(.4px); box-shadow: 0 0 14px #ff6a10;
+  }
+  .thumb.boat .hull {
+    position: absolute; left: 50%; top: 44%; width: 30%; height: 10%;
+    background: linear-gradient(180deg, #5b5e66, #23252b); border-radius: 12% 70% 40% 12% / 40% 60% 60% 40%;
+    box-shadow: 0 4px 0 -1px #49d2ff, 0 9px 18px rgba(73,210,255,.35);
+  }
   .meta { padding: 14px 16px 16px; }
   .meta h2 { font-size: 1.05rem; margin: 0 0 4px; }
   .meta p { margin: 0; color: var(--muted); font-size: .92rem; }
@@ -57,6 +72,14 @@
         <h2>Magma Cracks</h2>
         <p>Hover the black slab: connected magma cracks open, follow the cursor, then glue back without a trace.</p>
         <time datetime="2026-11-08">Nov 2026 · WebGL2 · Web Audio</time>
+      </div>
+    </a>
+    <a class="card" href="magma-boat/">
+      <div class="thumb boat"><div class="hull"></div></div>
+      <div class="meta">
+        <h2>Magma Boat</h2>
+        <p>Steer a hovering boat across a crust of cooled lava: its deep fin splits the plates into a magma wake that seals behind it.</p>
+        <time datetime="2026-11-09">Nov 2026 · WebGL2 raymarching · Web Audio</time>
       </div>
     </a>
   </section>
