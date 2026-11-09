@@ -1184,6 +1184,7 @@ void main() {
     if (boat.escapeT > 0) boat.escapeT -= dt;
     if (!hit) {
       boat.inContact = false; boat.freeT += dt;
+      if (boat.freeT < 0.3) boat.cT += dt;   // brief gaps between touches still count toward the no-progress window
       if (boat.freeT > 0.3) boat.slideSign = 0;
       return false;
     }
@@ -1232,10 +1233,11 @@ void main() {
   const FIN_LOCAL = [0, -0.78, -1.21];   // where the swept keel crosses the crust (boat frame, world units)
   let boatRotCols = new Float32Array(9), boatRows = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   function updateBoat(dt, t) {
-    let wantRate = 0, throttle = 0;
+    let wantRate = 0, throttle = 0, tgtDist = Infinity;
     if (ptr.active) {
       const T = onPlane(ptr.x, ptr.y);
       const dx = T[0] - boat.x, dz = T[1] - boat.z, dist = Math.hypot(dx, dz);
+      tgtDist = dist;
       if (dist > 0.9) {
         const err = wrapA(Math.atan2(dx, dz) - boat.yaw);
         const turnMax = 1.0 + 1.2 * Math.min(1, boat.v / 3);
@@ -1245,7 +1247,7 @@ void main() {
     }
     if (boat.contactT > 0) boat.contactT -= dt;
     if (boat.contactT > 0 || boat.escapeT > 0) {   // sliding / backing off the glass: hold course, keep a little way on
-      wantRate = 0; throttle = Math.max(throttle, 0.3);
+      wantRate = 0; if (tgtDist > 2.5) throttle = Math.max(throttle, 0.3);   // no forced way-on when the pointer is right here
     }
     boat.yawRate += (wantRate - boat.yawRate) * (1 - Math.exp(-dt * 5));
     boat.yaw = wrapA(boat.yaw + boat.yawRate * dt);
