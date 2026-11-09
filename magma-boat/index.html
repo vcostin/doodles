@@ -284,7 +284,7 @@ Berg makeBerg(vec2 cell) {
   vec2 h = hash2(cell), h2 = hash2(cell + vec2(57.0, 113.0)), h3 = hash2(cell + vec2(211.0, 17.0));
   b.on = h.x < 0.22 && !(abs(cell.x + 0.5) < 1.0 && abs(cell.y + 0.5) < 1.0);
   if (!b.on) return b;   // most cells are empty: skip the shard setup
-  vec2 c0 = (cell + 0.5 + (h2 - 0.5) * 0.2) * BC;
+  vec2 c0 = (cell + 0.5 + (h2 - 0.5) * 0.45) * BC;
   float big = h3.y > 0.86 ? 1.7 : 1.0;     // the odd giant
   for (int i = 0; i < 3; i++) {
     vec2 r = hash2(cell * 4.0 + vec2(float(i), 1.0)), r2 = hash2(cell * 4.0 + vec2(float(i), 2.0));
@@ -362,7 +362,8 @@ vec3 shadeBerg(Berg b, vec3 p, vec3 rd, vec3 L, float t) {
   float fade = 1.0 / (1.0 + t * 0.04);
   float sc = sin(length(p.xz * 1.3 + p.y * 0.6) * 9.0 + vnoise(p.xy * 0.8) * 6.0);
   vec3 g = vec3(vnoise(p.yz * 0.9), vnoise(p.zx * 0.9 + 3.0), vnoise(p.xy * 0.9 + 7.0)) - 0.5;
-  n = normalize(n + (0.07 * g + 0.025 * sc * normalize(g + 1e-3)) * fade);
+  float ndv0 = max(dot(n, -rd), 0.0);   // no ripple noise at grazing angles: it only sparkles there
+  n = normalize(n + (0.07 * g + 0.025 * sc * normalize(g + 1e-3)) * fade * smoothstep(0.05, 0.35, ndv0));
   float ndv = max(dot(n, -rd), 0.0);
   float fres = 0.07 + 0.93 * pow(1.0 - ndv, 4.0);
   vec3 r = reflect(rd, n);
@@ -370,8 +371,8 @@ vec3 shadeBerg(Berg b, vec3 p, vec3 rd, vec3 L, float t) {
   if (r.y > 0.0) env = skyClear(r) * 1.2;
   else {   // the crust below, with flecks of its glowing seams caught in the glass
     vec2 ur = r.xz / max(-r.y, 0.06) * 0.7 + p.xz * 0.08;
-    float fleck = smoothstep(0.66, 0.82, vnoise(ur * 3.0)) * smoothstep(-0.7, -0.05, r.y);
-    env = mix(vec3(0.02, 0.01, 0.008), vec3(0.18, 0.05, 0.015), smoothstep(-0.4, 0.0, r.y)) + vec3(0.9, 0.25, 0.04) * fleck * 0.5;
+    float fleck = smoothstep(0.8, 0.88, vnoise(ur * vec2(7.0, 1.6))) * smoothstep(-0.7, -0.05, r.y) * fade;
+    env = mix(vec3(0.02, 0.01, 0.008), vec3(0.18, 0.05, 0.015), smoothstep(-0.4, 0.0, r.y)) + vec3(0.9, 0.25, 0.04) * fleck * 0.3;
   }
   float rl = max(dot(r, L), 0.0);
   vec3 col = vec3(0.006, 0.0055, 0.007) * (MOON * max(dot(n, L), 0.0) + AMB);
@@ -698,6 +699,7 @@ vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hit
     float pxW = tp * pixAng;
     float dB = bergSD(b, vec3(P.x, 0.03, P.z));
     float w = 0.06 + 0.1 * vnoise(P.xz * 2.3);
+    w = max(w, 1.5 * pxW);
     float moat = (1.0 - smoothstep(w, w + 0.05 + pxW, dB)) * step(-0.3, dB);
     col = mix(col, magmaRamp(0.25 + 0.6 * clamp(dB / w, 0.0, 1.0), 0.85), moat);
     col += vec3(0.5, 0.12, 0.02) * exp(-max(dB, 0.0) / 0.5) * 0.25;
@@ -861,10 +863,22 @@ void main() {
   const TANH = Math.tan(31 * Math.PI / 180);
   const CAM_OFF = [0, 5.0, -8.2], LOOK_AHEAD = 7.0;   // high and far: lots of empty world
   // the camera swings slowly round behind the boat's heading (a few seconds' lag keeps pointing intuitive)
-  const cam = { fx: 0, fz: 0, yaw: 0, pos: [0, 0, 0], R: [1, 0, 0], U: [0, 1, 0], F: [0, 0, 1] };
-  function updateCamera() {
+  const cam = { fx: 0, fz: 0, yaw: 0, pull: 1, pos: [0, 0, 0], R: [1, 0, 0], U: [0, 1, 0], F: [0, 0, 1] };
+  function updateCamera(dt = 0) {
     const sx = Math.sin(cam.yaw), cz = Math.cos(cam.yaw);
-    cam.pos = [cam.fx + sx * CAM_OFF[2], CAM_OFF[1], cam.fz + cz * CAM_OFF[2]];
+    const want = [cam.fx + sx * CAM_OFF[2], CAM_OFF[1], cam.fz + cz * CAM_OFF[2]];
+    // never sit inside a berg or with glass between camera and boat: walk the boat-to-camera line
+    let frac = 1;
+    if (typeof bergDist === 'function') {
+      for (let i = 1; i <= 24; i++) {
+        const u = i / 24;
+        const x = boat.x + (want[0] - boat.x) * u, y = 1.2 + (want[1] - 1.2) * u, z = boat.z + (want[2] - boat.z) * u;
+        if (bergDist(x, y, z) < 0.9) { frac = Math.max(0.22, (i - 1.5) / 24); break; }
+      }
+    }
+    cam.pull += (frac - cam.pull) * (1 - Math.exp(-dt * (frac < cam.pull ? 14 : 1.2)));   // snap in, ease back out
+    const pl = cam.pull;
+    cam.pos = [boat.x + (want[0] - boat.x) * pl, 1.2 + (want[1] - 1.2) * pl + (1 - pl) * 1.6, boat.z + (want[2] - boat.z) * pl];
     cam.F = norm([cam.fx + sx * LOOK_AHEAD - cam.pos[0], -cam.pos[1], cam.fz + cz * LOOK_AHEAD - cam.pos[2]]);
     cam.R = norm(cross([0, 1, 0], cam.F));
     cam.U = cross(cam.F, cam.R);
@@ -1110,7 +1124,7 @@ void main() {
     if (b) return b;
     const h = hash2(cx, cz), h2 = hash2(cx + 57, cz + 113), h3 = hash2(cx + 211, cz + 17);
     b = { on: h[0] < 0.22 && !(Math.abs(cx + 0.5) < 1 && Math.abs(cz + 0.5) < 1), shards: [] };
-    const c0 = [(cx + 0.5 + (h2[0] - 0.5) * 0.2) * BC, (cz + 0.5 + (h2[1] - 0.5) * 0.2) * BC];
+    const c0 = [(cx + 0.5 + (h2[0] - 0.5) * 0.45) * BC, (cz + 0.5 + (h2[1] - 0.5) * 0.45) * BC];
     const big = h3[1] > 0.86 ? 1.7 : 1;
     for (let i = 0; i < 3; i++) {
       const r = hash2(cx * 4 + i, cz * 4 + 1), r2 = hash2(cx * 4 + i, cz * 4 + 2);
@@ -1147,38 +1161,45 @@ void main() {
     }
     return d;
   }
-  // keep bow, middle and stern clear of the glass: push out, then turn to slide along the face
+  // keep bow, middle and stern clear of the glass. On contact, commit to sliding one way along the face for
+  // a moment; wedged between two shards (opposing normals) back out along the open side instead.
+  const probeDist = (x, z, high) => high ? Math.min(bergDist(x, 0.4, z), bergDist(x, 1.4, z)) : bergDist(x, 0.4, z);
   function collide(dt) {
-    let hit = false, nx = 0, nz = 0;
+    let hit = 0, nx = 0, nz = 0;
     const fx = Math.sin(boat.yaw), fz = Math.cos(boat.yaw);
-    for (const [along, clear] of [[2.3, 0.3], [0.0, 1.0], [-1.6, 0.6]]) {
+    for (const [along, clear, high] of [[2.3, 0.3, true], [0.0, 1.0, false], [-1.6, 0.6, false]]) {
       const px = boat.x + fx * along, pz = boat.z + fz * along;
-      const d = bergDist(px, 0.4, pz);
+      const d = probeDist(px, pz, high);
       if (d >= clear) continue;
       const e = 0.05;
-      const gx = bergDist(px + e, 0.4, pz) - bergDist(px - e, 0.4, pz);
-      const gz = bergDist(px, 0.4, pz + e) - bergDist(px, 0.4, pz - e);
+      const gx = probeDist(px + e, pz, high) - probeDist(px - e, pz, high);
+      const gz = probeDist(px, pz + e, high) - probeDist(px, pz - e, high);
       const gl = Math.hypot(gx, gz) || 1;
       boat.x += gx / gl * (clear - d); boat.z += gz / gl * (clear - d);
-      nx += gx / gl; nz += gz / gl;
-      hit = true;
+      nx += gx / gl; nz += gz / gl; hit++;
     }
-    if (hit) {
-      const nl = Math.hypot(nx, nz) || 1; nx /= nl; nz /= nl;
-      const into = fx * nx + fz * nz;
-      if (into < 0) {   // heading into the glass: swing toward the tangent
-        const tx = fx - nx * into, tz = fz - nz * into;
-        boat.yaw = wrapA(boat.yaw + wrapA(Math.atan2(tx, tz) - boat.yaw) * Math.min(1, dt * 3));
-        boat.v *= Math.exp(-dt * (0.6 - into));
-      }
+    if (!hit) { if (boat.contactT <= 0) boat.slideSign = 0; return false; }
+    const nl = Math.hypot(nx, nz);
+    let dir;
+    if (hit > 1 && nl < 0.6 * hit) {
+      dir = Math.atan2(-fx, -fz);                         // V-gap: reverse out the way we came
+    } else {
+      nx /= nl || 1; nz /= nl || 1;
+      if (!boat.slideSign) boat.slideSign = (fx * -nz + fz * nx) >= 0 ? 1 : -1;   // the side we were already leaning to
+      const tx = -nz * boat.slideSign, tz = nx * boat.slideSign;
+      dir = Math.atan2(tx + nx * 0.35, tz + nz * 0.35);   // along the face, angled slightly away
     }
-    return hit;
+    boat.yaw = wrapA(boat.yaw + wrapA(dir - boat.yaw) * Math.min(1, dt * 4));
+    boat.yawRate *= Math.exp(-dt * 6);
+    boat.v = Math.max(boat.v * Math.exp(-dt * 0.8), 1.2);
+    boat.contactT = 0.9;
+    return true;
   }
 
   // ---------- boat ----------
   const MAXV = 6.2;
-  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.78, scrape: 0 };
-  window.__magmaBoat = { boat, ptr, bergDist: (x, z) => bergDist(x, 0.3, z) };   // for poking at it from the console
+  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.78, scrape: 0, contactT: 0, slideSign: 0 };
+  window.__magmaBoat = { boat, ptr, cam, bergDist: (x, z) => bergDist(x, 0.3, z) };   // for poking at it from the console
   const FIN_LOCAL = [0, -0.78, -1.21];   // where the swept keel crosses the crust (boat frame, world units)
   let boatRotCols = new Float32Array(9), boatRows = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   function updateBoat(dt, t) {
@@ -1192,6 +1213,9 @@ void main() {
         wantRate = Math.max(-turnMax, Math.min(turnMax, err * 2.4));
         throttle = Math.min(1, (dist - 0.9) / 12) * Math.pow(Math.max(0, Math.cos(err)), 1.5);
       }
+    }
+    if (boat.contactT > 0) {   // sliding off the glass: hold the committed slide, keep a little way on
+      boat.contactT -= dt; wantRate = 0; throttle = Math.max(throttle, 0.3);
     }
     boat.yawRate += (wantRate - boat.yawRate) * (1 - Math.exp(-dt * 5));
     boat.yaw = wrapA(boat.yaw + boat.yawRate * dt);
@@ -1263,8 +1287,9 @@ void main() {
     const k = 1 - Math.exp(-dt * 2.2);
     cam.fx += (boat.x + hx * boat.v * 0.35 - cam.fx) * k;
     cam.fz += (boat.z + hz * boat.v * 0.35 - cam.fz) * k;
-    if (boat.v > 0.5) cam.yaw = wrapA(cam.yaw + wrapA(boat.yaw - cam.yaw) * (1 - Math.exp(-dt * Math.min(1, boat.v / 3) / 3.5)));
-    updateCamera();
+    const swing = Math.max(Math.min(1, boat.v / 3), Math.min(1, Math.abs(boat.yawRate) / 0.6) * 0.8);
+    if (swing > 0.1) cam.yaw = wrapA(cam.yaw + wrapA(boat.yaw - cam.yaw) * (1 - Math.exp(-dt * swing / 3.0)));
+    updateCamera(dt);
 
     // drop wake points behind the fin; spacing grows with speed so the buffer spans a full lifespan
     const [fx, fz] = finWorld();
