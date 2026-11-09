@@ -46,10 +46,17 @@ uvec2 pcg2d(uvec2 v) {
 }
 vec2 hash2(vec2 p) { return vec2(pcg2d(uvec2(ivec2(floor(p + 0.5))))) * (1.0 / 4294967295.0); }
 float hash1(vec2 p) { return hash2(p).x; }
+float hashN(ivec2 q) {   // one-round integer hash: plenty for value noise, far cheaper than pcg2d
+  uint h = uint(q.x) * 1597334677u ^ uint(q.y) * 3812015801u;
+  h = (h ^ (h >> 15u)) * 2246822519u;
+  h ^= h >> 13u;
+  return float(h) * (1.0 / 4294967295.0);
+}
 float vnoise(vec2 p) {
-  vec2 i = floor(p), f = fract(p);
+  vec2 fl = floor(p), f = p - fl;
+  ivec2 i = ivec2(fl);
   vec2 u = f * f * (3.0 - 2.0 * f);
-  float a = hash1(i), b = hash1(i + vec2(1, 0)), c = hash1(i + vec2(0, 1)), d = hash1(i + vec2(1, 1));
+  float a = hashN(i), b = hashN(i + ivec2(1, 0)), c = hashN(i + ivec2(0, 1)), d = hashN(i + ivec2(1, 1));
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 float fbmN(vec2 p, int oct) {
@@ -278,72 +285,90 @@ const vec2 BA[7] = vec2[7](vec2(1.0, 0.0), vec2(0.5254, 0.8508), vec2(-0.1439, 0
 const vec2 BE[7] = vec2[7](vec2(0.9968, 0.0799), vec2(0.9838, 0.1790), vec2(0.9928, 0.1197), vec2(0.9759, 0.2182),
                            vec2(0.9988, -0.0500), vec2(0.9888, 0.1494), vec2(0.9950, 0.0998));
 // a berg = a cluster of three leaning glass shards, each with a chisel-cut tip
-struct Berg { bool on; vec2 c[3]; vec2 cs[3]; vec2 lean[3]; vec3 cap[3]; float H[3]; float off[21]; };
-Berg makeBerg(vec2 cell) {
-  Berg b;
+// The current berg lives in globals: passing a struct full of arrays by value makes ANGLE copy it on every call.
+// Facet planes (normal, offset) are rotated once per cell; plane 7 of each shard is its chisel cap.
+// gC0/gRad/gTop: a bounding cylinder, so rays that pass a cluster never touch the facet maths.
+bool gOn; vec2 gC0; float gRad, gTop; vec2 gC[3]; vec2 gLean[3]; vec4 gPl[24];
+bool loadBerg(vec2 cell) {
   vec2 h = hash2(cell), h2 = hash2(cell + vec2(57.0, 113.0)), h3 = hash2(cell + vec2(211.0, 17.0));
-  b.on = h.x < 0.22 && !(abs(cell.x + 0.5) < 1.0 && abs(cell.y + 0.5) < 1.0);
-  if (!b.on) return b;   // most cells are empty: skip the shard setup
+  gOn = h.x < 0.22 && !(abs(cell.x + 0.5) < 1.0 && abs(cell.y + 0.5) < 1.0);
+  if (!gOn) return false;   // most cells are empty: skip the shard setup
   vec2 c0 = (cell + 0.5 + (h2 - 0.5) * 0.45) * BC;
   float big = h3.y > 0.86 ? 1.7 : 1.0;     // the odd giant
+  gC0 = c0; gRad = 0.0; gTop = 0.0;
   for (int i = 0; i < 3; i++) {
     vec2 r = hash2(cell * 4.0 + vec2(float(i), 1.0)), r2 = hash2(cell * 4.0 + vec2(float(i), 2.0));
     float sc = (i == 0 ? 1.0 : 0.45 + 0.4 * r.x) * big;
     float R = (0.9 + 1.1 * h3.x) * sc;
     float yaw = r.y * 6.2832;
-    b.cs[i] = vec2(cos(yaw), sin(yaw));
+    vec2 cs = vec2(cos(yaw), sin(yaw));
     float a = 6.2832 * r2.x;
-    b.c[i] = c0 + (i == 0 ? vec2(0.0) : vec2(cos(a), sin(a)) * (1.4 + 1.2 * r2.y) * min(big, 1.3));
-    b.H[i] = (3.5 + 6.0 * h3.x) * sc * (0.7 + 0.6 * r2.y);
+    gC[i] = c0 + (i == 0 ? vec2(0.0) : vec2(cos(a), sin(a)) * (1.4 + 1.2 * r2.y) * min(big, 1.3));
+    float H = (3.5 + 6.0 * h3.x) * sc * (0.7 + 0.6 * r2.y);
     float la = a + 0.6 * (r.x - 0.5);
-    b.lean[i] = vec2(cos(la), sin(la)) * min(0.12 + 0.25 * r2.y, 3.5 / b.H[i]);
+    float lm = min(0.12 + 0.25 * r2.y, 3.5 / H);
+    gLean[i] = vec2(cos(la), sin(la)) * lm;
     float ca = 6.2832 * hash1(cell * 4.0 + vec2(float(i), 3.0)), ct = 0.55 + 0.4 * r.x;
-    b.cap[i] = vec3(sin(ct) * cos(ca), cos(ct), sin(ct) * sin(ca));
-    for (int k = 0; k < 7; k++) b.off[i * 7 + k] = R * (0.7 + 0.6 * hash1(cell * 32.0 + vec2(float(i * 7 + k), 9.0)));
+    vec3 cap = vec3(sin(ct) * cos(ca), cos(ct), sin(ct) * sin(ca));
+    gPl[i * 8 + 7] = vec4(cap, H * cap.y);
+    float omax = 0.0;
+    for (int k = 0; k < 7; k++) {
+      float o = R * (0.7 + 0.6 * hash1(cell * 32.0 + vec2(float(i * 7 + k), 9.0)));
+      vec2 rr = vec2(BA[k].x * cs.x - BA[k].y * cs.y, BA[k].x * cs.y + BA[k].y * cs.x);
+      gPl[i * 8 + k] = vec4(BE[k].x * rr.x, BE[k].y, BE[k].x * rr.y, o);
+      omax = max(omax, o);
+    }
+    float top = H + 1.6 * omax;
+    gRad = max(gRad, length(gC[i] - c0) + omax / 0.97 + lm * top + 0.3);
+    gTop = max(gTop, top);
   }
-  return b;
+  return true;
 }
-vec3 shardQ(Berg b, int i, vec3 p) { vec3 q = vec3(p.x - b.c[i].x, p.y, p.z - b.c[i].y); q.xz -= b.lean[i] * q.y; return q; }
-// largest and second-largest plane distance (their difference is small along a facet edge)
-vec2 shard2(Berg b, int i, vec3 q) {
-  float a = dot(q, b.cap[i]) - b.H[i] * b.cap[i].y, s = -1e9;
-  vec2 cs = b.cs[i];
-  for (int k = 0; k < 7; k++) {
-    vec2 r = vec2(BA[k].x * cs.x - BA[k].y * cs.y, BA[k].x * cs.y + BA[k].y * cs.x);
-    float v = dot(q, vec3(BE[k].x * r.x, BE[k].y, BE[k].x * r.y)) - b.off[i * 7 + k];
-    if (v > a) { s = a; a = v; } else if (v > s) s = v;
-  }
-  return vec2(a, s);
-}
-float bergSD(Berg b, vec3 p) {
+float bergBound(vec3 p) { return max(length(p.xz - gC0) - gRad, p.y - gTop); }
+vec3 shardQ(int i, vec3 p) { vec3 q = vec3(p.x - gC[i].x, p.y, p.z - gC[i].y); q.xz -= gLean[i] * q.y; return q; }
+float bergSD(vec3 p) {
   float d = 1e9;
-  for (int i = 0; i < 3; i++) d = min(d, shard2(b, i, shardQ(b, i, p)).x);
+  for (int i = 0; i < 3; i++) {
+    vec3 q = shardQ(i, p);
+    float a = -1e9;
+    for (int k = 0; k < 8; k++) { vec4 P = gPl[i * 8 + k]; a = max(a, dot(q, P.xyz) - P.w); }
+    d = min(d, a);
+  }
   return d;
 }
-float bergEdge(Berg b, vec3 p) {
+// gap between the largest and second-largest facet plane of the nearest shard: small along an edge
+float bergEdge(vec3 p) {
   vec2 best = vec2(1e9, 0.0);
-  for (int i = 0; i < 3; i++) { vec2 e = shard2(b, i, shardQ(b, i, p)); if (e.x < best.x) best = e; }
+  for (int i = 0; i < 3; i++) {
+    vec3 q = shardQ(i, p);
+    float a = -1e9, s = -1e9;
+    for (int k = 0; k < 8; k++) {
+      vec4 P = gPl[i * 8 + k];
+      float v = dot(q, P.xyz) - P.w;
+      if (v > a) { s = a; a = v; } else if (v > s) s = v;
+    }
+    if (a < best.x) best = vec2(a, s);
+  }
   return best.x - best.y;
 }
 // march cell by cell: empty cells are skipped in one step
-float traceBergs(vec3 ro, vec3 rd, float tmax, out Berg hb) {
+float traceBergs(vec3 ro, vec3 rd, float tmax) {   // on a hit, the globals hold that berg
   float t = 0.0;
   vec2 lastCell = vec2(1e9);
-  Berg b = makeBerg(floor(ro.xz / BC));
   for (int i = 0; i < 110; i++) {
     if (t > tmax) break;
     vec3 p = ro + rd * t;
     if (p.y > 26.0 && rd.y >= 0.0) break;
     vec2 cell = floor(p.xz / BC);
-    if (cell != lastCell) { b = makeBerg(cell); lastCell = cell; }
+    if (cell != lastCell) { loadBerg(cell); lastCell = cell; }
     vec2 cmin = cell * BC;
     float tx = rd.x > 1e-5 ? (cmin.x + BC - p.x) / rd.x : (rd.x < -1e-5 ? (cmin.x - p.x) / rd.x : 1e9);
     float tz = rd.z > 1e-5 ? (cmin.y + BC - p.z) / rd.z : (rd.z < -1e-5 ? (cmin.y - p.z) / rd.z : 1e9);
-    float d = b.on ? bergSD(b, p) : 1e9;
-    if (d < 0.0012 * t + 0.002) { hb = b; return t; }
+    float d = gOn ? bergBound(p) : 1e9;
+    if (d < 0.5) d = bergSD(p);
+    if (d < 0.0012 * t + 0.002) return t;
     t += min(d * 0.8, min(tx, tz) + 0.02);
   }
-  hb = b;
   return 1e9;
 }
 vec3 skyClear(vec3 rd) {   // sky without the cloud veil: what polished glass mirrors cleanly
@@ -352,12 +377,12 @@ vec3 skyClear(vec3 rd) {   // sky without the cloud veil: what polished glass mi
   float m = max(dot(rd, MOONDIR), 0.0);
   return c + moonGlow(rd) + vec3(1.0, 0.9, 0.74) * smoothstep(0.99984, 0.99991, m) * 0.85;
 }
-vec3 shadeBerg(Berg b, vec3 p, vec3 rd, vec3 L, float t) {
+vec3 shadeBerg(vec3 p, vec3 rd, vec3 L, float t) {
   float e = 0.002 + 0.0008 * t;
   vec2 k = vec2(e, 0.0);
-  vec3 n = normalize(vec3(bergSD(b, p + k.xyy) - bergSD(b, p - k.xyy),
-                          bergSD(b, p + k.yxy) - bergSD(b, p - k.yxy),
-                          bergSD(b, p + k.yyx) - bergSD(b, p - k.yyx)));
+  vec3 n = normalize(vec3(bergSD(p + k.xyy) - bergSD(p - k.xyy),
+                          bergSD(p + k.yxy) - bergSD(p - k.yxy),
+                          bergSD(p + k.yyx) - bergSD(p - k.yyx)));
   // faint conchoidal scallops: curved shell bands across each facet
   float fade = 1.0 / (1.0 + t * 0.04);
   float sc = sin(length(p.xz * 1.3 + p.y * 0.6) * 9.0 + vnoise(p.xy * 0.8) * 6.0);
@@ -386,7 +411,7 @@ vec3 shadeBerg(Berg b, vec3 p, vec3 rd, vec3 L, float t) {
   col += LANTC * (pow(lr, 350.0) * 5.0 + pow(lr, 25.0) * 0.12) / (1.0 + ld * ld * 0.04);
   // knife-sharp facet edges catch the light
   float pxw = 0.0012 * t + 0.002;
-  float edge = 1.0 - smoothstep(pxw, pxw + 0.05, bergEdge(b, p));
+  float edge = 1.0 - smoothstep(pxw, pxw + 0.05, bergEdge(p));
   col += (HAZE * 0.9 + moonGlow(r) * 0.8 + vec3(0.06, 0.05, 0.05)) * edge * mix(0.5, 1.0, fade);
   return col;
 }
@@ -619,10 +644,12 @@ vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool
   vec2 u = P.xz * S;
   vec2 Wl = warpLow(u);
   const float e = 0.05;
-  vec2 Jx = (warpLow(u + vec2(e, 0.0)) - Wl) / e, Jy = (warpLow(u + vec2(0.0, e)) - Wl) / e;
-  mat2 M = S * mat2(vec2(1.0, 0.0) + Jx, vec2(0.0, 1.0) + Jy);   // d(lattice)/d(world)
-  vec2 X = u + Wl + warpHi(u);
   bool live = I > 0.004;
+  // d(lattice)/d(world): the warp's slope only matters where plates move (the wake), so skip it elsewhere
+  vec2 Jx = vec2(0.0), Jy = vec2(0.0);
+  if (live) { Jx = (warpLow(u + vec2(e, 0.0)) - Wl) / e; Jy = (warpLow(u + vec2(0.0, e)) - Wl) / e; }
+  mat2 M = S * mat2(vec2(1.0, 0.0) + Jx, vec2(0.0, 1.0) + Jy);
+  vec2 X = u + Wl + warpHi(u);
   Q q = plates(X, P.xz, M, live);
   float G = max(q.sd1 + max(q.sd2, 0.0), 1e-5);   // local gap width (lattice)
   float cover = 1.0 - smoothstep(-pxL, pxL, q.sd1);
@@ -694,10 +721,9 @@ vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool
 vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hitB, float tb) {
   vec3 col = crustBase(ro, rd, tp, invR, L, pixAng, hitB, tb);
   vec3 P = ro + rd * tp;
-  Berg b = makeBerg(floor(P.xz / BC));
-  if (b.on) {
+  if (loadBerg(floor(P.xz / BC)) && bergBound(vec3(P.x, 0.03, P.z)) < 0.6) {
     float pxW = tp * pixAng;
-    float dB = bergSD(b, vec3(P.x, 0.03, P.z));
+    float dB = bergSD(vec3(P.x, 0.03, P.z));
     float w = 0.06 + 0.1 * vnoise(P.xz * 2.3);
     w = max(w, 1.5 * pxW);
     float moat = (1.0 - smoothstep(w, w + 0.05 + pxW, dB)) * step(-0.3, dB);
@@ -725,8 +751,7 @@ void main() {
   float tb, tNear, dNear;
   bool hitB = traceBoat(ro, rd, invR, tb, tNear, dNear);
   float tp = rd.y < -1e-4 ? -ro.y / rd.y : 1e9;
-  Berg hb;
-  float tg = traceBergs(ro, rd, min(tp, 260.0), hb);
+  float tg = traceBergs(ro, rd, min(tp, 260.0));
   float tS = min(tp, tg);
 
   // boat coverage with a one-pixel soft edge
@@ -736,7 +761,7 @@ void main() {
 
   vec3 col = vec3(0.0);
   if (aB < 1.0) {
-    if (tg < tp) col = fogged(shadeBerg(hb, ro + rd * tg, rd, L, tg), tg * 0.8, rd);   // glass stays darker in the haze
+    if (tg < tp) col = fogged(shadeBerg(ro + rd * tg, rd, L, tg), tg * 0.8, rd);   // glass stays darker in the haze
     else if (tp > 1e8) col = sky(rd);
     else col = fogged(crust(ro, rd, tp, invR, L, pixAng, hitB, tb), tp, rd);
   }
