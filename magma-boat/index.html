@@ -136,15 +136,19 @@ uniform float uUpGlow;     // how much open magma is near the boat (0..1)
 uniform sampler2D uField;
 uniform vec2  uFieldOrg;
 uniform float uFieldSize;
+uniform vec4  uSmoke[14];   // funnel smoke puffs: xyz world, w age 0..1 (<0 unused)
 out vec4 fragColor;
 
 const float S = 1.4;       // plates per world unit
 const float SR = 0.4, DR = 2.5;
 const float HM = 0.07;     // magma surface sits this far below the crust top (plate thickness)
-const vec3 MOON = vec3(0.30, 0.33, 0.42);
-const vec3 AMB  = vec3(0.075, 0.042, 0.03);
+const vec3 MOON = vec3(0.55, 0.58, 0.68);
+const vec3 MOONDIR = vec3(-0.378, 0.1393, 0.9153);   // low moon, ahead and to the left
+const vec3 AMB  = vec3(0.08, 0.044, 0.032);
 const vec3 HAZE = vec3(0.30, 0.11, 0.045);
-const vec3 TEAL = vec3(0.22, 0.82, 1.0);
+const vec3 AETHER = vec3(0.45, 1.0, 0.82);
+const vec3 LANTC = vec3(1.0, 0.62, 0.26);
+const vec3 LANT_L = vec3(0.0, 0.589, 1.02);   // bow lantern, boat local
 
 // ---------- field ----------
 vec4 fieldTex(vec2 w) {
@@ -244,18 +248,143 @@ vec3 magmaRamp(float t, float heat) {
   return c;
 }
 
-// ---------- sky ----------
+// ---------- sky: smoke-veiled dusk with a low moon ----------
+vec3 moonGlow(vec3 rd) { float m = max(dot(rd, MOONDIR), 0.0); return vec3(1.0, 0.9, 0.74) * (pow(m, 90.0) * 0.22 + pow(m, 12.0) * 0.06); }
 vec3 sky(vec3 rd) {
   float h = max(rd.y, 0.0);
   vec3 c = mix(HAZE * 1.08, vec3(0.035, 0.028, 0.03), smoothstep(0.0, 0.42, h));
   vec2 sp = rd.xz / (h + 0.12) * 1.1 + vec2(uTime * 0.012, 0.0);
   float cl = fbm(sp);
-  c = mix(c, c * 0.5 + HAZE * 0.06, smoothstep(0.45, 0.8, cl) * smoothstep(0.0, 0.18, h));
+  float veil = smoothstep(0.45, 0.8, cl) * smoothstep(0.0, 0.18, h);
+  c = mix(c, c * 0.5 + HAZE * 0.06, veil);
+  float m = max(dot(rd, MOONDIR), 0.0);
+  float disc = smoothstep(0.99984, 0.99991, m);
+  c += vec3(1.0, 0.9, 0.74) * disc * 0.85 * (1.0 - 0.6 * veil);
+  c += moonGlow(rd) * (1.0 - 0.6 * veil);
   return c;
 }
-vec3 fogged(vec3 c, float t) { return mix(c, HAZE, 1.0 - exp(-max(t - 5.0, 0.0) * 0.028)); }
+vec3 fogged(vec3 c, float t, vec3 rd) {
+  vec3 hz = HAZE * 1.08 + moonGlow(normalize(vec3(rd.x, 0.0, rd.z)));   // = the sky right at the horizon
+  return mix(c, hz, 1.0 - exp(-max(t - 8.0, 0.0) * 0.02));
+}
 
-// ---------- boat ----------
+// ---------- obsidian bergs: sparse faceted glass shards, at most one per 30-unit cell ----------
+const float BC = 30.0;
+const vec2 BA[7] = vec2[7](vec2(1.0, 0.0), vec2(0.5254, 0.8508), vec2(-0.1439, 0.9896), vec2(-0.9215, 0.3883),
+                           vec2(-0.9398, -0.3418), vec2(-0.1538, -0.9881), vec2(0.5917, -0.8061));
+const vec2 BE[7] = vec2[7](vec2(0.9287, 0.3709), vec2(0.8525, 0.5227), vec2(0.9131, 0.4078), vec2(0.8139, 0.5810),
+                           vec2(0.9359, 0.3523), vec2(0.8776, 0.4794), vec2(0.9004, 0.4350));
+struct Berg { bool on; vec2 c, cs, c2, cs2, lean; float H, H2; float off[7]; float off2[7]; };
+Berg makeBerg(vec2 cell) {
+  Berg b;
+  vec2 h = hash2(cell), h2 = hash2(cell + vec2(57.0, 113.0)), h3 = hash2(cell + vec2(211.0, 17.0));
+  b.on = h.x < 0.5 && !(abs(cell.x + 0.5) < 1.0 && abs(cell.y + 0.5) < 1.0);
+  b.c = (cell + 0.5 + (h2 - 0.5) * 0.3) * BC;
+  float R = 2.0 + 4.5 * h3.x;
+  float yaw = h.y * 6.2832;
+  b.cs = vec2(cos(yaw), sin(yaw));
+  b.H = R * (0.9 + 1.3 * h3.y);
+  float a2 = yaw * 1.7, R2 = R * 0.5;
+  b.c2 = b.c + R * 0.75 * vec2(cos(a2), sin(a2));
+  b.cs2 = vec2(cos(yaw * 2.3 + 1.0), sin(yaw * 2.3 + 1.0));
+  b.H2 = R2 * (1.3 + 2.0 * h2.x);
+  for (int k = 0; k < 7; k++) {
+    b.off[k] = R * (0.55 + 0.8 * hash1(cell * 8.0 + vec2(float(k), 3.0)));
+    b.off2[k] = R2 * (0.55 + 0.8 * hash1(cell * 8.0 + vec2(float(k), 5.0)));
+  }
+  b.lean = vec2(cos(yaw * 3.1), sin(yaw * 3.1)) * (0.05 + 0.13 * h3.y);
+  return b;
+}
+float polyt(vec3 q, vec2 cs, float H, float off[7]) {   // convex shard: steep facets + a slanted cap
+  float d = max(q.y - H, dot(q, vec3(0.5 * cs.x, 0.866, 0.5 * cs.y)) - H * 0.82);
+  for (int k = 0; k < 7; k++) {
+    vec2 a = vec2(BA[k].x * cs.x - BA[k].y * cs.y, BA[k].x * cs.y + BA[k].y * cs.x);
+    d = max(d, dot(q, vec3(BE[k].x * a.x, BE[k].y, BE[k].x * a.y)) - off[k]);
+  }
+  return d;
+}
+float bergSD(Berg b, vec3 p) {
+  vec3 q = vec3(p.x - b.c.x, p.y, p.z - b.c.y); q.xz -= b.lean * q.y;
+  vec3 q2 = vec3(p.x - b.c2.x, p.y, p.z - b.c2.y); q2.xz -= b.lean * 1.4 * q2.y;
+  return min(polyt(q, b.cs, b.H, b.off), polyt(q2, b.cs2, b.H2, b.off2));
+}
+// largest and second-largest facet plane: their difference is small along a facet edge
+vec2 polyt2(vec3 q, vec2 cs, float H, float off[7]) {
+  float a = q.y - H, b = -1e9;
+  float c = dot(q, vec3(0.5 * cs.x, 0.866, 0.5 * cs.y)) - H * 0.82;
+  if (c > a) { b = a; a = c; } else b = c;
+  for (int k = 0; k < 7; k++) {
+    vec2 r = vec2(BA[k].x * cs.x - BA[k].y * cs.y, BA[k].x * cs.y + BA[k].y * cs.x);
+    float v = dot(q, vec3(BE[k].x * r.x, BE[k].y, BE[k].x * r.y)) - off[k];
+    if (v > a) { b = a; a = v; } else if (v > b) b = v;
+  }
+  return vec2(a, b);
+}
+float bergEdge(Berg b, vec3 p) {
+  vec3 q = vec3(p.x - b.c.x, p.y, p.z - b.c.y); q.xz -= b.lean * q.y;
+  vec3 q2 = vec3(p.x - b.c2.x, p.y, p.z - b.c2.y); q2.xz -= b.lean * 1.4 * q2.y;
+  vec2 e1 = polyt2(q, b.cs, b.H, b.off), e2 = polyt2(q2, b.cs2, b.H2, b.off2);
+  vec2 e = e1.x < e2.x ? e1 : e2;
+  return e.x - e.y;
+}
+// march cell by cell: empty cells are skipped in one step
+float traceBergs(vec3 ro, vec3 rd, float tmax, out Berg hb) {
+  float t = 0.0;
+  vec2 lastCell = vec2(1e9);
+  Berg b = makeBerg(floor(ro.xz / BC));
+  for (int i = 0; i < 110; i++) {
+    if (t > tmax) break;
+    vec3 p = ro + rd * t;
+    if (p.y > 22.0 && rd.y >= 0.0) break;
+    vec2 cell = floor(p.xz / BC);
+    if (cell != lastCell) { b = makeBerg(cell); lastCell = cell; }
+    vec2 cmin = cell * BC;
+    float tx = rd.x > 1e-5 ? (cmin.x + BC - p.x) / rd.x : (rd.x < -1e-5 ? (cmin.x - p.x) / rd.x : 1e9);
+    float tz = rd.z > 1e-5 ? (cmin.y + BC - p.z) / rd.z : (rd.z < -1e-5 ? (cmin.y - p.z) / rd.z : 1e9);
+    float d = b.on ? bergSD(b, p) : 1e9;
+    if (d < 0.0012 * t + 0.002) { hb = b; return t; }
+    t += min(d * 0.8, min(tx, tz) + 0.02);
+  }
+  hb = b;
+  return 1e9;
+}
+vec3 shadeBerg(Berg b, vec3 p, vec3 rd, vec3 L, float t) {
+  float e = 0.002 + 0.0008 * t;
+  vec2 k = vec2(e, 0.0);
+  vec3 n = normalize(vec3(bergSD(b, p + k.xyy) - bergSD(b, p - k.xyy),
+                          bergSD(b, p + k.yxy) - bergSD(b, p - k.yxy),
+                          bergSD(b, p + k.yyx) - bergSD(b, p - k.yyx)));
+  // conchoidal ripples: obsidian breaks in shell-like waves, so reflections wobble across each facet
+  vec3 g = vec3(vnoise(p.yz * 1.6), vnoise(p.zx * 1.6 + 3.0), vnoise(p.xy * 1.6 + 7.0)) - 0.5;
+  vec3 g2 = vec3(vnoise(p.yz * 6.5 + 1.0), vnoise(p.zx * 6.5 + 4.0), vnoise(p.xy * 6.5 + 9.0)) - 0.5;
+  float fade = 1.0 / (1.0 + t * 0.04);
+  n = normalize(n + (0.22 * g + 0.08 * g2) * fade);
+  float ndv = max(dot(n, -rd), 0.0);
+  float fres = 0.1 + 0.9 * pow(1.0 - ndv, 4.0);
+  vec3 r = reflect(rd, n);
+  vec3 env;
+  if (r.y > 0.0) env = sky(r) * 1.25;
+  else {   // the crust below, with flecks of its glowing seams caught in the glass
+    vec2 ur = r.xz / max(-r.y, 0.06) * 0.7 + p.xz * 0.08;
+    float fleck = smoothstep(0.66, 0.82, vnoise(ur * 3.0)) * smoothstep(-0.7, -0.05, r.y);
+    env = mix(vec3(0.03, 0.014, 0.01), vec3(0.2, 0.055, 0.016), smoothstep(-0.4, 0.0, r.y)) + vec3(0.9, 0.25, 0.04) * fleck * 0.5;
+  }
+  float rl = max(dot(r, L), 0.0);
+  vec3 col = vec3(0.011, 0.01, 0.013) * (MOON * max(dot(n, L), 0.0) + AMB);
+  col += env * fres * 1.3 + MOON * (pow(rl, 500.0) * 5.0 + pow(rl, 30.0) * 0.18);
+  col += vec3(0.7, 0.18, 0.03) * exp(-p.y * 1.4) * (0.55 + 0.75 * max(-n.y, 0.0)) * 0.2;   // molten moat below
+  // the bow lantern glinting in the black glass
+  vec3 lw = uBoatPos + uBoatRot * LANT_L - p;
+  float ld = length(lw), lr = max(dot(r, lw / ld), 0.0);
+  col += LANTC * (pow(lr, 350.0) * 5.0 + pow(lr, 25.0) * 0.12) / (1.0 + ld * ld * 0.04);
+  // knife-sharp facet edges catch the light
+  float pxw = 0.0012 * t + 0.002;
+  float edge = 1.0 - smoothstep(pxw, pxw + 0.05, bergEdge(b, p));
+  col += (HAZE * 0.9 + moonGlow(r) * 0.8 + vec3(0.06, 0.05, 0.05)) * edge * fade;
+  return col;
+}
+
+// ---------- boat: a Victorian steam skiff on levitation orbs ----------
 float sdEll(vec3 p, vec3 r) { float k0 = length(p / r), k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / k1; }
 float sdBox(vec3 p, vec3 b) { vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
 float sdCap(vec3 p, vec3 a, vec3 b, float r) {
@@ -263,28 +392,47 @@ float sdCap(vec3 p, vec3 a, vec3 b, float r) {
   float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
   return length(pa - ba * h) - r;
 }
-float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+float sdCylY(vec3 p, float r, float y0, float y1) {
+  vec2 d = vec2(length(p.xz) - r, abs(p.y - 0.5 * (y0 + y1)) - 0.5 * (y1 - y0));
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+float sdTorusY(vec3 p, float R, float r) { return length(vec2(length(p.xz) - R, p.y)) - r; }
+float deckY(float z) { float s = z / 1.45; return 0.10 + 0.11 * s * s + 0.05 * max(s, 0.0); }
 
-// mat: 0 hull, 2 canopy, 3 fin
+// mat: 0 wood, 1 wheelhouse, 2 funnel iron, 3 keel blade, 4 brass, 5 orb, 6 lantern
 float boatSDF(vec3 p, out float mat) {
-  float taper = 1.0 - 0.5 * smoothstep(-0.2, 1.3, p.z);          // narrow, pointed bow
-  float hull = sdEll(vec3(p.x / taper, p.y, p.z), vec3(0.46, 0.17, 1.35)) * taper;
-  hull = max(hull, -p.z - 1.12);                                   // flat transom
-  hull = max(hull, p.y - 0.10);                                    // flat deck
-  float pods = sdCap(vec3(abs(p.x), p.y, p.z), vec3(0.43, -0.07, -0.85), vec3(0.43, -0.07, 0.5), 0.09);
-  hull = smin(hull, pods, 0.07);
-  float tail = sdBox(vec3(p.x, p.y - 0.2, p.z + 0.92 + 0.3 * (p.y - 0.1)), vec3(0.018, 0.12, 0.15)) - 0.012;
-  hull = smin(hull, tail, 0.03);
-  float canopy = sdEll(p - vec3(0.0, 0.1, 0.2), vec3(0.19, 0.13, 0.5));
-  // deep swept fin hanging from the stern, thin and tapering to the trailing edge
-  float fy = clamp((-p.y - 0.1) / 1.3, 0.0, 1.0);
-  float zc = -0.78 - 0.5 * fy;
-  float ch = mix(0.32, 0.14, fy);
-  vec3 q = vec3(p.x, p.y + 0.75, p.z - zc);
-  float th = 0.03 * (0.45 + 0.55 * smoothstep(-ch, ch * 0.6, q.z));
-  float fin = sdBox(q, vec3(th, 0.66, ch)) - 0.008;
+  float taper = 1.0 - 0.55 * smoothstep(0.0, 1.45, p.z) - 0.22 * smoothstep(0.6, 1.45, -p.z);
+  float body = sdEll(vec3(p.x / taper, p.y - 0.12, p.z), vec3(0.52, 0.46, 1.48)) * taper;
+  float dy = deckY(p.z);
+  float hull = max(body, p.y - dy - 0.065);
+  hull = max(hull, -max(body + 0.035, dy - p.y));          // hollow bulwark around the deck
   float d = hull; mat = 0.0;
-  if (canopy < d) { d = canopy; mat = 2.0; }
+  float bs = sdCap(p, vec3(0.0, deckY(1.25), 1.25), vec3(0.0, deckY(1.25) + 0.24, 1.9), 0.02);
+  if (bs < d) { d = bs; mat = 0.0; }
+  vec3 c = p - vec3(0.0, deckY(-0.4) + 0.14, -0.4);
+  float cab = sdBox(c, vec3(0.19, 0.13, 0.27)) - 0.025;
+  float roof = sdBox(c - vec3(0.0, 0.16, 0.0), vec3(0.23, 0.012, 0.31)) - 0.01;
+  if (cab < d) { d = cab; mat = 1.0; }
+  if (roof < d) { d = roof; mat = 4.0; }
+  vec3 f = p - vec3(0.0, 0.0, 0.14); f.z += 0.14 * (p.y - 0.2);
+  float fun = sdCylY(f, 0.07 + 0.02 * smoothstep(0.66, 0.8, f.y), 0.05, 0.82);
+  if (fun < d) { d = fun; mat = (f.y > 0.72 || f.y < 0.2) ? 4.0 : 2.0; }
+  float post = sdCap(p, vec3(0.0, deckY(1.02), 1.02), LANT_L - vec3(0.0, 0.05, 0.0), 0.012);
+  if (post < d) { d = post; mat = 4.0; }
+  float lan = length(p - LANT_L) - 0.045;
+  if (lan < d) { d = lan; mat = 6.0; }
+  vec3 o = vec3(abs(p.x) - 0.3, p.y + 0.3, abs(p.z + 0.02) - 0.55);
+  float ring = min(sdTorusY(o, 0.115, 0.016), sdCap(o, vec3(0.0), vec3(0.0, 0.22, 0.0), 0.016));
+  if (ring < d) { d = ring; mat = 4.0; }
+  float orb = length(o) - 0.09;
+  if (orb < d) { d = orb; mat = 5.0; }
+  // deep swept keel blade at the stern
+  float fy = clamp((-p.y - 0.2) / 1.3, 0.0, 1.0);
+  float zc = -0.75 - 0.5 * fy;
+  float ch = mix(0.3, 0.13, fy);
+  vec3 q = vec3(p.x, p.y + 0.85, p.z - zc);
+  float th = 0.03 * (0.45 + 0.55 * smoothstep(-ch, ch * 0.6, q.z));
+  float fin = sdBox(q, vec3(th, 0.65, ch)) - 0.008;
   if (fin < d) { d = fin; mat = 3.0; }
   return d;
 }
@@ -295,21 +443,20 @@ vec3 boatNormal(vec3 p) {
   return normalize(k.xyy * boatMap(p + k.xyy * e) + k.yyx * boatMap(p + k.yyx * e)
                  + k.yxy * boatMap(p + k.yxy * e) + k.xxx * boatMap(p + k.xxx * e));
 }
-// returns 1 on hit; on a near miss, tNear/dNear describe the closest approach (for edge antialiasing)
 bool traceBoat(vec3 ro, vec3 rd, mat3 invR, out float t, out float tNear, out float dNear) {
   t = 1e9; tNear = 1e9; dNear = 1e9;
-  vec3 C = uBoatPos + uBoatRot * vec3(0.0, -0.45, -0.15);
+  vec3 C = uBoatPos + uBoatRot * vec3(0.0, -0.3, 0.2);
   vec3 oc = ro - C;
-  float b = dot(oc, rd), c = dot(oc, oc) - 1.95 * 1.95, h = b * b - c;
+  float b = dot(oc, rd), c = dot(oc, oc) - 2.0 * 2.0, h = b * b - c;
   if (h < 0.0) return false;
   h = sqrt(h);
   float tt = max(-b - h, 0.0), tmax = -b + h;
   vec3 lro = invR * (ro - uBoatPos), lrd = invR * rd;
-  for (int i = 0; i < 96; i++) {
+  for (int i = 0; i < 110; i++) {
     float d = boatMap(lro + lrd * tt);
     if (d < dNear) { dNear = d; tNear = tt; }
-    if (d < 0.0006 * tt) { t = tt; return true; }
-    tt += d * 0.72;
+    if (d < 0.0005 * tt) { t = tt; return true; }
+    tt += d * 0.75;
     if (tt > tmax) break;
   }
   return false;
@@ -320,41 +467,72 @@ vec3 shadeBoat(vec3 pw, vec3 rd, mat3 invR, vec3 L) {
   vec3 nl = boatNormal(lp);
   vec3 n = uBoatRot * nl;
   float ndv = max(dot(n, -rd), 0.0);
-  float fres = pow(1.0 - ndv, 4.0);
-  vec3 base = vec3(0.15, 0.155, 0.17);
-  float spP = 56.0, spK = 0.7, refl = 0.55;
-  vec3 em = vec3(0.0);
-  if (mat > 1.5 && mat < 2.5) {          // dark glass canopy with a faint amber cabin glow
-    base = vec3(0.012, 0.014, 0.018); spP = 140.0; spK = 1.1; refl = 1.0;
-    em += vec3(0.5, 0.22, 0.06) * 0.12 * (1.0 - smoothstep(-0.2, 0.4, nl.y));
-  } else if (mat < 0.5) {
-    float stripe = 1.0 - smoothstep(0.004, 0.011, abs(lp.y - 0.02 - 0.03 * lp.z));
-    base = mix(base, vec3(0.42, 0.39, 0.34), stripe * step(-1.0, lp.z));
+  float fres = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+  vec3 base = vec3(0.0), em = vec3(0.0);
+  float spP = 20.0, spK = 0.12, refl = 0.15;
+  bool metal = false;
+  float flick = 0.88 + 0.12 * vnoise(vec2(uTime * 7.0, 3.0));
+  if (mat < 0.5) {
+    float dy = deckY(lp.z);
+    if (nl.y > 0.75 && lp.y < dy + 0.015) {                       // deck planks along the length
+      float seam = smoothstep(0.0, 0.12, abs(fract(lp.x * 11.0) - 0.5) * 2.0);
+      base = vec3(0.24, 0.165, 0.1) * (0.7 + 0.45 * vnoise(vec2(floor(lp.x * 11.0) * 3.7, lp.z * 2.0))) * mix(0.45, 1.0, seam);
+    } else if (lp.y > dy + 0.04) {                                // brass rail cap
+      base = vec3(0.5, 0.36, 0.14); metal = true;
+    } else if (lp.y < -0.1 + 0.05 * lp.z) {                       // copper sheathing with verdigris
+      base = mix(vec3(0.3, 0.15, 0.07), vec3(0.11, 0.22, 0.17), smoothstep(0.5, 0.8, vnoise(lp.zy * 7.0)));
+      spP = 40.0; spK = 0.35; refl = 0.3;
+    } else {                                                       // mahogany hull planks
+      float pl = abs(fract(lp.y * 14.0) - 0.5) * 2.0;
+      base = vec3(0.17, 0.075, 0.04) * (0.75 + 0.45 * vnoise(vec2(lp.z * 2.5, floor(lp.y * 14.0) * 3.1)))
+           * mix(0.5, 1.0, smoothstep(0.0, 0.15, pl));
+      spP = 30.0; spK = 0.18;
+    }
+  } else if (mat < 1.5) {                                         // green wheelhouse with lit windows
+    vec3 c = lp - vec3(0.0, deckY(-0.4) + 0.14, -0.4);
+    base = vec3(0.045, 0.085, 0.06); spK = 0.25;
+    float wy = 1.0 - smoothstep(0.035, 0.05, abs(c.y - 0.02));
+    float side = step(0.6, abs(nl.x)) * (1.0 - step(0.55, abs(fract(c.z * 4.2 + 0.5) - 0.5) * 2.0));
+    float ends = step(0.6, abs(nl.z)) * (1.0 - smoothstep(0.09, 0.11, abs(c.x)));
+    float win = wy * max(side, ends);
+    base = mix(base, vec3(0.05), win);
+    em += vec3(1.0, 0.55, 0.18) * 1.3 * win * flick;
+  } else if (mat < 2.5) {
+    base = vec3(0.035, 0.033, 0.032); spP = 40.0; spK = 0.3; refl = 0.2;
+  } else if (mat < 3.5) {
+    base = vec3(0.06, 0.06, 0.065); spP = 40.0; spK = 0.3;
+    float hot = 1.0 - smoothstep(-0.05, 0.32, pw.y);
+    em += magmaRamp(1.0 - 0.9 * hot, 1.0) * hot * 1.1;
+  } else if (mat < 4.5) {
+    base = vec3(0.5, 0.36, 0.14); metal = true;
+  } else if (mat < 5.5) {                                          // levitation orb: swirling aether
+    float sw = vnoise(nl.xz * 3.0 + vec2(uTime * 0.7, -uTime * 0.4));
+    em += AETHER * (1.2 + 0.9 * sw) * (0.6 + 0.4 * ndv);
+  } else {
+    em += LANTC * 3.0 * flick;
   }
+  if (metal) { spP = 60.0; spK = 0.9; refl = 0.7; }
   float diff = max(dot(n, L), 0.0);
   float sp = pow(max(dot(n, normalize(L - rd)), 0.0), spP) * spK;
   float up = max(-n.y, 0.0);
-  vec3 magL = vec3(1.0, 0.36, 0.08) * (0.18 + 1.3 * uUpGlow) * (0.2 + 0.8 * up);
+  vec3 lightIn = MOON * diff + AMB * 1.6;
+  lightIn += vec3(1.0, 0.36, 0.08) * (0.15 + 1.2 * uUpGlow) * (0.2 + 0.8 * up);       // magma below
   float dF = length(pw.xz - uFinPos);
-  magL += vec3(1.0, 0.45, 0.1) * exp(-dF * dF / 0.3) * (1.0 - smoothstep(0.0, 0.8, pw.y)) * 1.1;
-  vec3 col = base * (MOON * diff + AMB * 1.6 + magL) + MOON * sp;
+  lightIn += vec3(1.0, 0.45, 0.1) * exp(-dF * dF / 0.3) * (1.0 - smoothstep(0.0, 0.8, pw.y)) * 1.1;
+  lightIn += AETHER * 0.35 * up;                                                       // orbs underneath
+  vec3 lw = uBoatPos + uBoatRot * LANT_L - pw;
+  float ll = length(lw);
+  lightIn += LANTC * flick * max(dot(n, lw / ll), 0.0) * 0.5 / (1.0 + ll * ll * 5.0);   // bow lantern
+  vec3 tint = metal ? base * 2.2 : vec3(1.0);
+  vec3 col = base * lightIn + MOON * sp * tint;
   vec3 rdir = reflect(rd, n);
   vec3 env = rdir.y > 0.0 ? sky(rdir) : vec3(0.26, 0.07, 0.02) * (0.4 + uUpGlow);
-  col += env * fres * refl;
-  // antigravity emitters along the underside of the pods
-  float pod = 1.0 - smoothstep(0.08, 0.16, length(vec2(abs(lp.x) - 0.43, lp.y + 0.07)));
-  pod *= smoothstep(0.05, -0.6, nl.y) * step(lp.z, 0.55) * step(-0.9, lp.z);
-  em += TEAL * pod * (2.2 + 0.3 * sin(uTime * 9.0 + lp.z * 6.0));
-  // fin: heated where it meets the magma
-  if (mat > 2.5) {
-    float hot = 1.0 - smoothstep(-0.05, 0.32, pw.y);
-    em += magmaRamp(1.0 - 0.9 * hot, 1.0) * hot * 1.1;
-  }
+  col += env * fres * refl * tint;
   return col + em;
 }
 
 // ---------- crust shading ----------
-vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hitB, float tb) {
+vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hitB, float tb) {
   vec3 P = ro + rd * tp;
   float sinG = max(-rd.y, 1e-3);
   float pxW = tp * pixAng * 0.5 * (1.0 + 1.0 / max(sinG, 0.1));   // pixel footprint on the crust
@@ -364,17 +542,23 @@ vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hit
   float I = F0.r;
   float heat = smoothstep(0.05, 0.7, I);
 
-  // boat light on the crust: soft moon shadow, teal hover pool, glow where the fin cuts in
+  // boat light on the crust: long moon shadow, aether pools under the orbs, lantern pool, glow at the fin
   vec3 ps = P + L * ((uBoatPos.y - P.y) / L.y);
   vec3 lbs = invR * (ps - uBoatPos);
-  float vis = 1.0 - 0.75 * exp(-(lbs.x * lbs.x / 0.2 + lbs.z * lbs.z / 1.4));
+  float vis = 1.0 - 0.7 * exp(-(lbs.x * lbs.x / 0.22 + lbs.z * lbs.z / 1.6));
   vec3 lb = invR * (P - uBoatPos);
-  float pool = exp(-(pow(abs(lb.x) - 0.43, 2.0) / 0.09 + pow(lb.z + 0.15, 2.0) / 0.9)) * 0.85
-             + exp(-(lb.x * lb.x / 0.7 + lb.z * lb.z / 2.2)) * 0.22;
+  vec2 oq = vec2(abs(lb.x) - 0.3, abs(lb.z + 0.02) - 0.55);
+  float pool = exp(-dot(oq, oq) / 0.12) * 0.55 + exp(-(lb.x * lb.x / 0.5 + lb.z * lb.z / 1.6)) * 0.16;
+  vec3 lw = uBoatPos + uBoatRot * LANT_L - P;
+  float l2 = dot(lw, lw);
+  float flick = 0.88 + 0.12 * vnoise(vec2(uTime * 7.0, 3.0));
   vec2 dfp = P.xz - uFinPos;
-  vec3 addL = TEAL * pool * 1.5 * (0.9 + 0.1 * sin(uTime * 9.0)) + vec3(1.0, 0.42, 0.08) * exp(-dot(dfp, dfp) / 0.12) * 0.8;
+  vec3 addL = AETHER * pool * (0.9 + 0.1 * sin(uTime * 2.3))
+            + LANTC * flick * 0.55 * (lw.y / sqrt(l2)) / (1.0 + l2 * 0.8)
+            + vec3(1.0, 0.42, 0.08) * exp(-dot(dfp, dfp) / 0.12) * 0.8;
 
-  vec3 avgRock = vec3(0.075, 0.062, 0.054) * (MOON * 0.6 * vis + AMB + addL);
+  vec3 avgRock = vec3(0.075, 0.062, 0.054) * (MOON * 0.14 * vis + AMB + addL)
+              + MOON * 0.22 * vis * pow(max(dot(reflect(rd, vec3(0.0, 1.0, 0.0)), L), 0.0), 18.0);   // moon path
   float vS = length(fSplit(F0));
   vec3 avg = mix(avgRock + vec3(0.045, 0.007, 0.0), magmaRamp(0.35, heat), clamp(vS * S * 0.9, 0.0, 0.6));
   if (lod >= 1.0) return avg;
@@ -397,7 +581,7 @@ vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hit
   vec3 nr = normalize(vec3(-(hx - hb) / 0.02 * 0.16, 1.0, -(hz - hb) / 0.02 * 0.16));
   vec3 alb = vec3(0.08, 0.068, 0.06) * (0.6 + 0.8 * tone) * (0.72 + 0.56 * hb);
   float diff = max(dot(nr, L), 0.0);
-  float spec = pow(max(dot(nr, normalize(L - rd)), 0.0), 30.0) * 0.14;
+  float spec = pow(max(dot(nr, normalize(L - rd)), 0.0), 26.0) * 0.24;
   vec3 rock = alb * (MOON * diff * vis + AMB + addL) + MOON * spec * vis;
 
   // cooled seams between resting plates: thin, dim, some almost dark
@@ -452,29 +636,82 @@ vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hit
   return mix(det, avg, lod);
 }
 
+// a molten moat where the crust meets each berg
+vec3 crust(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool hitB, float tb) {
+  vec3 col = crustBase(ro, rd, tp, invR, L, pixAng, hitB, tb);
+  vec3 P = ro + rd * tp;
+  Berg b = makeBerg(floor(P.xz / BC));
+  if (b.on) {
+    float pxW = tp * pixAng;
+    float dB = bergSD(b, vec3(P.x, 0.03, P.z));
+    float w = 0.06 + 0.1 * vnoise(P.xz * 2.3);
+    float moat = (1.0 - smoothstep(w, w + 0.05 + pxW, dB)) * step(-0.3, dB);
+    col = mix(col, magmaRamp(0.25 + 0.6 * clamp(dB / w, 0.0, 1.0), 0.85), moat);
+    col += vec3(0.5, 0.12, 0.02) * exp(-max(dB, 0.0) / 0.5) * 0.25;
+  }
+  return col;
+}
+vec3 halo(vec3 col, vec3 ro, vec3 rd, vec3 c, float tD, vec3 hc, float k) {
+  vec3 oc = c - ro;
+  float tc = dot(oc, rd);
+  if (tc < 0.0 || tc > tD + 0.12) return col;
+  float d2 = max(dot(oc, oc) - tc * tc, 0.0);
+  return col + hc * k * (0.0009 / (d2 + 0.0009) + 0.05 * exp(-d2 / 0.3));
+}
+
 void main() {
   vec2 ndc = (gl_FragCoord.xy * 2.0 - uRes) / uRes.y;
   vec3 rd = normalize(uCamR * ndc.x * uTanH + uCamU * ndc.y * uTanH + uCamF);
   vec3 ro = uCamPos;
-  vec3 L = normalize(vec3(-0.45, 0.62, 0.65));
+  vec3 L = MOONDIR;
   float pixAng = 2.0 * uTanH / uRes.y;
   mat3 invR = transpose(uBoatRot);
 
   float tb, tNear, dNear;
   bool hitB = traceBoat(ro, rd, invR, tb, tNear, dNear);
   float tp = rd.y < -1e-4 ? -ro.y / rd.y : 1e9;
+  Berg hb;
+  float tg = traceBergs(ro, rd, min(tp, 170.0), hb);
+  float tS = min(tp, tg);
 
   // boat coverage with a one-pixel soft edge
   float aB = 0.0, tB = 1e9;
-  if (hitB && tb < tp) { aB = 1.0; tB = tb; }
-  else if (!hitB && tNear < tp) { aB = 1.0 - smoothstep(0.0, tNear * pixAng, dNear); tB = tNear; }
+  if (hitB && tb < tS) { aB = 1.0; tB = tb; }
+  else if (!hitB && tNear < tS) { aB = 1.0 - smoothstep(0.0, tNear * pixAng, dNear); tB = tNear; }
 
   vec3 col = vec3(0.0);
   if (aB < 1.0) {
-    if (tp > 1e8) col = sky(rd);
-    else col = fogged(crust(ro, rd, tp, invR, L, pixAng, hitB, tb), tp);
+    if (tg < tp) col = fogged(shadeBerg(hb, ro + rd * tg, rd, L, tg), tg, rd);
+    else if (tp > 1e8) col = sky(rd);
+    else col = fogged(crust(ro, rd, tp, invR, L, pixAng, hitB, tb), tp, rd);
   }
-  if (aB > 0.0) col = mix(col, fogged(shadeBoat(ro + rd * tB, rd, invR, L), tB), aB);
+  if (aB > 0.0) col = mix(col, fogged(shadeBoat(ro + rd * tB, rd, invR, L), tB, rd), aB);
+  float tD = aB > 0.5 ? tB : tS;
+
+  // funnel smoke: soft analytic puffs, lit warm from below
+  for (int i = 0; i < 14; i++) {
+    vec4 sm = uSmoke[i];
+    if (sm.w < 0.0) continue;
+    float r = 0.14 + 1.1 * sm.w;
+    vec3 oc = sm.xyz - ro;
+    float tc = dot(oc, rd);
+    if (tc < 0.0 || tc - r > tD) continue;
+    float d2 = max(dot(oc, oc) - tc * tc, 0.0);
+    if (d2 > 4.0 * r * r) continue;
+    vec3 x = ro + rd * tc - sm.xyz;
+    float wisp = 0.55 + 0.9 * (vnoise(x.xy / r * 1.6 + float(i) * 7.3) - 0.5);
+    float dens = exp(-d2 / (r * r)) * pow(1.0 - sm.w, 1.4) * 0.85 * wisp;
+    dens *= clamp((tD - (tc - r)) / (2.0 * r), 0.0, 1.0);
+    vec3 sc = vec3(0.16, 0.145, 0.135) + vec3(0.25, 0.07, 0.02) * 0.35 * (1.0 - sm.w);
+    col = mix(col, fogged(sc, tc, rd), clamp(dens, 0.0, 0.85));
+  }
+  // glow halos: the bow lantern and the four orbs
+  float flick = 0.88 + 0.12 * vnoise(vec2(uTime * 7.0, 3.0));
+  col = halo(col, ro, rd, uBoatPos + uBoatRot * LANT_L, tD, LANTC, 0.9 * flick);
+  for (int i = 0; i < 4; i++) {
+    vec3 ol = vec3(i < 2 ? 0.3 : -0.3, -0.3, (i % 2 == 0) ? 0.53 : -0.57);
+    col = halo(col, ro, rd, uBoatPos + uBoatRot * ol, tD, AETHER, 0.25);
+  }
 
   col += (hash1(gl_FragCoord.xy) - 0.5) / 255.0;   // dither the dark gradients
   fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(0.92)), 1.0);
@@ -511,7 +748,7 @@ void main() {
   }
   const fieldProg = program(fragSrc('fs-field'), ['uOrg', 'uSize', 'uRes', 'uTime', 'uPts', 'uAux', 'uCount']);
   const mainProg = program(fragSrc('fs'), ['uRes', 'uTime', 'uCamPos', 'uCamR', 'uCamU', 'uCamF', 'uTanH',
-    'uBoatPos', 'uBoatRot', 'uFinPos', 'uUpGlow', 'uField', 'uFieldOrg', 'uFieldSize']);
+    'uBoatPos', 'uBoatRot', 'uFinPos', 'uUpGlow', 'uField', 'uFieldOrg', 'uFieldSize', 'uSmoke']);
 
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -568,8 +805,8 @@ void main() {
   }
 
   // ---------- camera: fixed orientation, follows the boat (steering by pointing stays intuitive) ----------
-  const TANH = Math.tan(25 * Math.PI / 180);
-  const CAM_OFF = [0, 3.9, -5.6], LOOK_AHEAD = 1.4;
+  const TANH = Math.tan(31 * Math.PI / 180);
+  const CAM_OFF = [0, 5.0, -8.2], LOOK_AHEAD = 7.0;   // high and far: lots of empty world
   const cam = { fx: 0, fz: 0, pos: [0, 0, 0], R: [1, 0, 0], U: [0, 1, 0], F: [0, 0, 1] };
   function updateCamera() {
     cam.pos = [cam.fx + CAM_OFF[0], CAM_OFF[1], cam.fz + CAM_OFF[2]];
@@ -596,7 +833,7 @@ void main() {
   // ---------- sound (Web Audio, fully synthesized) ----------
   const Sound = (() => {
     let ctx = null, master, on = false;
-    let rumbleG, hissG, sizzleG, sizzleF, whooshG, humG, humA, humB, white, brown;
+    let rumbleG, hissG, sizzleG, sizzleF, windG, windF, humG, humA, humB, white, brown;
     let lastCrack = 0, lastCrunch = 0, lastGloop = 0, susTimer = 0;
     function noise(kind) {
       const len = ctx.sampleRate * 2, b = ctx.createBuffer(1, len, ctx.sampleRate), d = b.getChannelData(0);
@@ -633,14 +870,16 @@ void main() {
       // the fin slicing through magma: a band of sizzle that brightens with speed
       sizzleG = gainNode(); sizzleF = filt('bandpass', 1800, 0.9);
       loop(white).connect(sizzleF).connect(sizzleG);
-      // air rushing past the hull
-      whooshG = gainNode();
-      loop(brown).connect(filt('bandpass', 420, 0.6)).connect(whooshG);
-      // antigravity hum: two detuned tones a fifth apart with a slow beat, rising with speed
+      // lonely wind over the crust, slowly gusting; stronger with speed
+      windG = gainNode(); windF = filt('bandpass', 650, 0.5);
+      loop(brown).connect(windF).connect(windG);
+      const gust = ctx.createOscillator(); gust.frequency.value = 0.07;
+      const gustG = ctx.createGain(); gustG.gain.value = 260; gust.connect(gustG).connect(windF.frequency); gust.start();
+      // levitation orbs: a low, soft drone a fifth apart with a slow beat
       humG = gainNode();
-      const humF = filt('lowpass', 520, 0.8); humF.connect(humG);
-      humA = ctx.createOscillator(); humA.type = 'sine'; humA.frequency.value = 58;
-      humB = ctx.createOscillator(); humB.type = 'triangle'; humB.frequency.value = 87.4;
+      const humF = filt('lowpass', 380, 0.8); humF.connect(humG);
+      humA = ctx.createOscillator(); humA.type = 'sine'; humA.frequency.value = 49;
+      humB = ctx.createOscillator(); humB.type = 'sine'; humB.frequency.value = 73.6;
       const gA = ctx.createGain(); gA.gain.value = 0.7; const gB = ctx.createGain(); gB.gain.value = 0.35;
       humA.connect(gA).connect(humF); humB.connect(gB).connect(humF);
       const trem = ctx.createOscillator(); trem.frequency.value = 3.2;
@@ -683,6 +922,35 @@ void main() {
       th.start(t); th.stop(t + 0.25);
       crackle(x, strength);
     }
+    // steam chuff from the funnel
+    function chuff(x, strength) {
+      if (!on) return;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.2);
+      const s = ctx.createBufferSource(); s.buffer = white;
+      const g = ctx.createGain(), lp = filt('lowpass', 1100, 0.9);
+      lp.frequency.setValueAtTime(1300, t); lp.frequency.exponentialRampToValueAtTime(350, t + 0.2);
+      s.connect(filt('highpass', 120)).connect(lp).connect(g).connect(o);
+      env(g, t, 0.012, 0.09 * strength, 0.22);
+      s.start(t, Math.random() * 1.5, 0.3);
+    }
+    // timber creak: a sawtooth through a narrow band, stick-slip chopped
+    function creak(x) {
+      if (!on) return;
+      const t = ctx.currentTime, o = out((x - 0.5) * 1.2);
+      const f = 70 + Math.random() * 60, dur = 0.25 + Math.random() * 0.35;
+      const osc = ctx.createOscillator(); osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(f, t);
+      osc.frequency.linearRampToValueAtTime(f * (1.1 + Math.random() * 0.25), t + dur * 0.5);
+      osc.frequency.linearRampToValueAtTime(f * 0.92, t + dur);
+      const bp = filt('bandpass', 500 + Math.random() * 500, 7);
+      const chop = ctx.createGain(); chop.gain.value = 0.5;
+      const slip = ctx.createOscillator(); slip.type = 'square'; slip.frequency.value = 18 + Math.random() * 20;
+      const slipG = ctx.createGain(); slipG.gain.value = 0.5; slip.connect(slipG).connect(chop.gain);
+      const g = ctx.createGain();
+      osc.connect(bp).connect(chop).connect(g).connect(o);
+      env(g, t, 0.06, 0.06, dur);
+      osc.start(t); slip.start(t); osc.stop(t + dur + 0.1); slip.stop(t + dur + 0.1);
+    }
     function bubble(x) {
       if (!on) return;
       const t = ctx.currentTime, o = out((x - 0.5) * 1.4);
@@ -715,10 +983,10 @@ void main() {
       hissG.gain.setTargetAtTime(Math.min(1, m.healing * 0.08) * 0.05, t, 0.15);
       sizzleG.gain.setTargetAtTime(0.012 + sp * 0.07, t, 0.1);
       sizzleF.frequency.setTargetAtTime(1500 + sp * 2600, t, 0.15);
-      whooshG.gain.setTargetAtTime(sp * sp * 0.32, t, 0.15);
-      humG.gain.setTargetAtTime(0.16 + sp * 0.06, t, 0.2);
-      humA.frequency.setTargetAtTime(58 + sp * 14 + m.turn * 4, t, 0.25);
-      humB.frequency.setTargetAtTime(87.4 + sp * 21 + m.turn * 6, t, 0.25);
+      windG.gain.setTargetAtTime(0.09 + sp * sp * 0.25, t, 0.3);
+      humG.gain.setTargetAtTime(0.1 + sp * 0.04, t, 0.2);
+      humA.frequency.setTargetAtTime(49 + sp * 6 + m.turn * 3, t, 0.3);
+      humB.frequency.setTargetAtTime(73.6 + sp * 9 + m.turn * 4.5, t, 0.3);
       if (Math.random() < Math.min(m.open, 6) * 0.6 * dt) bubble(m.x);
     }
     function setOn(v) {
@@ -728,13 +996,14 @@ void main() {
       clearTimeout(susTimer);
       if (on) ctx.resume();
       else {
-        for (const g of [rumbleG, hissG, sizzleG, whooshG, humG]) { g.gain.cancelScheduledValues(t); g.gain.setTargetAtTime(0, t, 0.05); }
+        for (const g of [rumbleG, hissG, sizzleG, windG, humG]) { g.gain.cancelScheduledValues(t); g.gain.setTargetAtTime(0, t, 0.05); }
         susTimer = setTimeout(() => { if (!on) ctx.suspend(); }, 400);
       }
       master.gain.setTargetAtTime(on ? 0.9 : 0, t, 0.05);
     }
     const safe = fn => (...a) => { try { return fn(...a); } catch (e) { on = false; console.warn('sound disabled:', e); } };
     return { crackle: safe(crackle), crunch: safe(crunch), gloop: safe(gloop), update: safe(update),
+             chuff: safe(chuff), creak: safe(creak),
              setOn, get on() { return on; } };
   })();
 
@@ -764,10 +1033,85 @@ void main() {
   canvas.addEventListener('pointerleave', () => { ptr.active = false; });
   canvas.addEventListener('pointercancel', () => { ptr.active = false; });
 
+  // ---------- obsidian bergs: exact mirror of the shader's layout, for collision ----------
+  function pcg2d(x, y) {
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0; y = (Math.imul(y, 1664525) + 1013904223) >>> 0;
+    x = (x + Math.imul(y, 1664525)) >>> 0; y = (y + Math.imul(x, 1664525)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0; y = (y ^ (y >>> 16)) >>> 0;
+    x = (x + Math.imul(y, 1664525)) >>> 0; y = (y + Math.imul(x, 1664525)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0; y = (y ^ (y >>> 16)) >>> 0;
+    return [x / 4294967295, y / 4294967295];
+  }
+  const hash2 = (x, y) => pcg2d(Math.floor(x + 0.5) | 0, Math.floor(y + 0.5) | 0);
+  const BC = 30;
+  const BA = [[1, 0], [0.5254, 0.8508], [-0.1439, 0.9896], [-0.9215, 0.3883], [-0.9398, -0.3418], [-0.1538, -0.9881], [0.5917, -0.8061]];
+  const BE = [[0.9287, 0.3709], [0.8525, 0.5227], [0.9131, 0.4078], [0.8139, 0.5810], [0.9359, 0.3523], [0.8776, 0.4794], [0.9004, 0.4350]];
+  const bergCache = new Map();
+  function makeBerg(cx, cz) {
+    const key = cx + ',' + cz;
+    let b = bergCache.get(key);
+    if (b) return b;
+    const h = hash2(cx, cz), h2 = hash2(cx + 57, cz + 113), h3 = hash2(cx + 211, cz + 17);
+    b = { on: h[0] < 0.5 && !(Math.abs(cx + 0.5) < 1 && Math.abs(cz + 0.5) < 1) };
+    const R = 2 + 4.5 * h3[0], yaw = h[1] * 6.2832, a2 = yaw * 1.7, R2 = R * 0.5;
+    b.c = [(cx + 0.5 + (h2[0] - 0.5) * 0.3) * BC, (cz + 0.5 + (h2[1] - 0.5) * 0.3) * BC];
+    b.cs = [Math.cos(yaw), Math.sin(yaw)]; b.H = R * (0.9 + 1.3 * h3[1]);
+    b.c2 = [b.c[0] + R * 0.75 * Math.cos(a2), b.c[1] + R * 0.75 * Math.sin(a2)];
+    b.cs2 = [Math.cos(yaw * 2.3 + 1), Math.sin(yaw * 2.3 + 1)]; b.H2 = R2 * (1.3 + 2.0 * h2[0]);
+    b.off = []; b.off2 = [];
+    for (let k = 0; k < 7; k++) {
+      b.off.push(R * (0.55 + 0.8 * hash2(cx * 8 + k, cz * 8 + 3)[0]));
+      b.off2.push(R2 * (0.55 + 0.8 * hash2(cx * 8 + k, cz * 8 + 5)[0]));
+    }
+    b.lean = [Math.cos(yaw * 3.1) * (0.05 + 0.13 * h3[1]), Math.sin(yaw * 3.1) * (0.05 + 0.13 * h3[1])];
+    if (bergCache.size > 400) bergCache.clear();
+    bergCache.set(key, b);
+    return b;
+  }
+  function polyt(qx, qy, qz, cs, H, off) {
+    let d = Math.max(qy - H, 0.5 * cs[0] * qx + 0.866 * qy + 0.5 * cs[1] * qz - H * 0.82);
+    for (let k = 0; k < 7; k++) {
+      const ax = BA[k][0] * cs[0] - BA[k][1] * cs[1], az = BA[k][0] * cs[1] + BA[k][1] * cs[0];
+      d = Math.max(d, BE[k][0] * ax * qx + BE[k][1] * qy + BE[k][0] * az * qz - off[k]);
+    }
+    return d;
+  }
+  function bergDist(x, y, z) {
+    const cx = Math.floor(x / BC), cz = Math.floor(z / BC);
+    let d = 1e9;
+    for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+      const b = makeBerg(cx + i, cz + j);
+      if (!b.on) continue;
+      d = Math.min(d,
+        polyt(x - b.c[0] - b.lean[0] * y, y, z - b.c[1] - b.lean[1] * y, b.cs, b.H, b.off),
+        polyt(x - b.c2[0] - b.lean[0] * 1.4 * y, y, z - b.c2[1] - b.lean[1] * 1.4 * y, b.cs2, b.H2, b.off2));
+    }
+    return d;
+  }
+  // keep bow, middle and stern clear of the glass: slide along it, losing a little speed
+  function collide(dt) {
+    let hit = false;
+    const fx = Math.sin(boat.yaw), fz = Math.cos(boat.yaw);
+    for (const [along, clear] of [[1.6, 0.35], [0.0, 0.75], [-1.1, 0.45]]) {
+      const px = boat.x + fx * along, pz = boat.z + fz * along;
+      const d = bergDist(px, 0.3, pz);
+      if (d >= clear) continue;
+      const e = 0.05;
+      let gx = bergDist(px + e, 0.3, pz) - bergDist(px - e, 0.3, pz);
+      let gz = bergDist(px, 0.3, pz + e) - bergDist(px, 0.3, pz - e);
+      const gl = Math.hypot(gx, gz) || 1;
+      boat.x += gx / gl * (clear - d); boat.z += gz / gl * (clear - d);
+      hit = true;
+    }
+    if (hit) boat.v *= Math.exp(-dt * 2.5);
+    return hit;
+  }
+
   // ---------- boat ----------
   const MAXV = 6.2;
-  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.58 };
-  const FIN_LOCAL = [0, -0.58, -0.96];   // where the swept fin crosses the crust (boat local)
+  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.62, scrape: 0 };
+  window.__magmaBoat = { boat, ptr, bergDist: (x, z) => bergDist(x, 0.3, z) };   // for poking at it from the console
+  const FIN_LOCAL = [0, -0.62, -0.91];   // where the swept fin crosses the crust (boat local)
   let boatRotCols = new Float32Array(9), boatRows = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   function updateBoat(dt, t) {
     let wantRate = 0, throttle = 0;
@@ -787,12 +1131,13 @@ void main() {
     boat.v += (vT - boat.v) * (1 - Math.exp(-dt * (vT > boat.v ? 1.1 : 0.8)));
     boat.x += Math.sin(boat.yaw) * boat.v * dt;
     boat.z += Math.cos(boat.yaw) * boat.v * dt;
+    boat.scrape = collide(dt) ? 1 : 0;
     const acc = (boat.v - v0) / Math.max(dt, 1e-3);
     const rollT = Math.max(-0.35, Math.min(0.35, -boat.yawRate * (0.12 + boat.v * 0.06)));
     boat.roll += (rollT - boat.roll) * (1 - Math.exp(-dt * 4));
     const pitchT = Math.max(-0.06, Math.min(0.09, acc * 0.03)) + 0.012 * Math.sin(t * 1.3);
     boat.pitch += (pitchT - boat.pitch) * (1 - Math.exp(-dt * 3));
-    boat.y = 0.58 + 0.035 * Math.sin(t * 1.6) + 0.018 * Math.sin(t * 2.7 + 1.0);
+    boat.y = 0.62 + 0.035 * Math.sin(t * 1.6) + 0.018 * Math.sin(t * 2.7 + 1.0);
     const cy = Math.cos(boat.yaw), sy = Math.sin(boat.yaw), cp = Math.cos(boat.pitch), spp = Math.sin(boat.pitch);
     const cr = Math.cos(boat.roll), sr = Math.sin(boat.roll);
     boatRows = mul3(mul3([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], [[1, 0, 0], [0, cp, spp], [0, -spp, cp]]), [[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]]);
@@ -821,6 +1166,11 @@ void main() {
   const nowS = () => performance.now() / 1000;
   const t0 = nowS();
   let lastFrame = t0, perfAcc = 0, perfN = 0, perfT = t0;
+  // funnel smoke: puffs leave the funnel top, rise, swell, drift downwind and thin out
+  const SMOKE_N = 14, SMOKE_LIFE = 4.5, FUNNEL_L = [0, 0.84, 0.05];
+  const puffs = [];
+  const smokeArr = new Float32Array(SMOKE_N * 4);
+  let nextPuff = 0, creakT = 2;
   cam.fx = boat.x; cam.fz = boat.z;
 
   function frame() {
@@ -857,6 +1207,25 @@ void main() {
     }
     while (pts.length && (now - pts[0].born > LIFESPAN || pts.length > MAX_PTS - 1)) pts.shift();
 
+    // smoke
+    if (now > nextPuff) {
+      const M = boatRows, l = FUNNEL_L;
+      puffs.push({ x: boat.x + M[0][0] * l[0] + M[0][1] * l[1] + M[0][2] * l[2],
+                   y: boat.y + M[1][0] * l[0] + M[1][1] * l[1] + M[1][2] * l[2],
+                   z: boat.z + M[2][0] * l[0] + M[2][1] * l[1] + M[2][2] * l[2], born: now });
+      if (puffs.length > SMOKE_N) puffs.shift();
+      nextPuff = now + 0.5 - 0.3 * Math.min(1, boat.v / 5);
+      Sound.chuff(screenX01(boat.x, boat.y, boat.z), 0.5 + 0.5 * Math.min(1, boat.v / 5));
+    }
+    smokeArr.fill(-1);
+    puffs.forEach((p, i) => {
+      const a = (now - p.born) / SMOKE_LIFE;
+      p.y += (0.55 - 0.25 * a) * dt; p.x += 0.22 * dt; p.z += 0.05 * dt;
+      if (a < 1) smokeArr.set([p.x, p.y, p.z, a], i * 4);
+    });
+    // the hull creaks now and then, more in hard turns and against the glass
+    creakT -= dt * (0.15 + 1.6 * Math.min(1, turn) + 6 * boat.scrape);
+    if (creakT < 0) { Sound.creak(screenX01(boat.x, boat.y, boat.z)); creakT = 1 + Math.random() * 2.5; }
     const m = { open: 0, healing: 0, speed: boat.v, turn: Math.min(1, turn), x: pan };
     let n = 0, near = 0;
     for (const p of pts) {
@@ -915,6 +1284,7 @@ void main() {
     gl.uniformMatrix3fv(U.uBoatRot, false, boatRotCols);
     gl.uniform2f(U.uFinPos, fx, fz);
     gl.uniform1f(U.uUpGlow, Math.min(1, near * 2.5));
+    gl.uniform4fv(U.uSmoke, smokeArr);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     schedule();
   }
