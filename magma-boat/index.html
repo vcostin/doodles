@@ -133,13 +133,13 @@ void main() {
 <!--
   Crust cache bake: what never changes about the resting crust, stored per world texel in three toroidal
   layers around the boat (only newly exposed strips are re-baked as it moves).
-  o0 = seam distance (world, x2), seam-width noise, seam-glow noise, plate tone; o1 = bump height, bump slope xz.
+  o0 = seam distance (world, x2), seam-width noise, seam-glow noise, plate tone; o1 = coarse bump height, slope xz
+  (the fine grain is added live, faded by footprint).
 -->
 <script id="fs-bake" type="x-shader/x-fragment">
 uniform vec2  uBOrg;    // layer window corner (world xz, texel-snapped)
 uniform float uBSize;   // layer size (world)
 uniform float uBRes;    // texels across
-uniform vec2  uBK;      // which fine bump octaves this layer keeps
 layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
 void main() {
@@ -149,7 +149,7 @@ void main() {
   vec2 X = u + warpLow(u) + warpHi(u);
   Q q = plates(X, w, mat2(S), false);
   float dV = max(-q.sdV1, 0.0) / S;
-  float hb = bumpH(X, uBK), hx = bumpH(X + vec2(0.02, 0.0), uBK), hz = bumpH(X + vec2(0.0, 0.02), uBK);
+  float hb = bumpB(X), hx = bumpB(X + vec2(0.02, 0.0)), hz = bumpB(X + vec2(0.0, 0.02));
   vec2 sl = vec2(-(hx - hb), -(hz - hb)) / 0.02 * 0.16;
   o0 = vec4(min(dV, 0.5) * 2.0, vnoise(X * 1.7), vnoise(X * 0.8 + 3.0), hash1(floor(q.s1) + 17.0));
   o1 = vec4(hb, clamp(sl / 4.0 + 0.5, 0.0, 1.0), 0.0);
@@ -274,7 +274,15 @@ float voronoiEdgeFree(vec2 x) {   // distance to nearest Voronoi border (IQ), fu
 }
 
 // fine octaves fade with the pixel footprint so the mid-distance crust doesn't sparkle
-float bumpH(vec2 y, vec2 k) { return vnoise(y * 3.1) * 0.6 + vnoise(y * 9.3 + 4.0) * 0.28 * k.x + vnoise(y * 26.0 + 9.0) * 0.12 * k.y; }
+float bumpB(vec2 y) { return vnoise(y * 3.1) * 0.6; }   // coarse relief (in warped plate coordinates: baked)
+// fine grain, in unwarped lattice coordinates that ride with the plate; always evaluated live and faded by
+// pixel footprint (k), so the cached and live crust share exactly the same grain and nothing aliases
+float bumpF(vec2 v, vec2 k) { return vnoise(v * 9.3 + 4.0) * 0.28 * k.x + vnoise(v * 26.0 + 9.0) * 0.12 * k.y; }
+vec3 bumpFine(vec2 v, vec2 k) {   // (height, slope x, slope z) of the fine grain
+  if (k.x + k.y <= 0.0) return vec3(0.0);
+  float f0 = bumpF(v, k), fx = bumpF(v + vec2(0.02, 0.0), k), fz = bumpF(v + vec2(0.0, 0.02), k);
+  return vec3(f0, -(fx - f0) / 0.02 * 0.16, -(fz - f0) / 0.02 * 0.16);
+}
 
 // magma ramp: t = 0 gap center (hot) -> 1 gap margin (dark)
 vec3 magmaRamp(float t, float heat) {
@@ -696,8 +704,10 @@ vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool
   // resting crust (outside the wake): everything static comes from the baked cache; only lighting is live
   vec4 cA, cB;
   if (!live && crustCache(P.xz, pxL, cA, cB)) {
-    float dV = cA.x * 0.5, ws = 0.009 + 0.013 * cA.y, tone = cA.w, hb = cB.x;
-    vec2 sl = (cB.yz - 0.5) * 4.0;
+    vec2 kb = vec2(1.0 - smoothstep(0.06, 0.14, pxL), 1.0 - smoothstep(0.02, 0.05, pxL));
+    vec3 fg = bumpFine(P.xz * S, kb);
+    float dV = cA.x * 0.5, ws = 0.009 + 0.013 * cA.y, tone = cA.w, hb = cB.x + fg.x;
+    vec2 sl = (cB.yz - 0.5) * 4.0 + fg.yz;
     vec3 nr = normalize(vec3(sl.x, 1.0, sl.y));
     vec3 alb = vec3(0.08, 0.068, 0.06) * (0.6 + 0.8 * tone) * (0.72 + 0.56 * hb);
     float diff = max(dot(nr, L), 0.0);
@@ -728,8 +738,10 @@ vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool
   vec2 Yl = X - M * q.o1;
   float tone = hash1(floor(q.s1) + 17.0);
   vec2 kb = vec2(1.0 - smoothstep(0.06, 0.14, pxL), 1.0 - smoothstep(0.02, 0.05, pxL));
-  float hb = bumpH(Yl, kb), hx = bumpH(Yl + vec2(0.02, 0.0), kb), hz = bumpH(Yl + vec2(0.0, 0.02), kb);
-  vec3 nr = normalize(vec3(-(hx - hb) / 0.02 * 0.16, 1.0, -(hz - hb) / 0.02 * 0.16));
+  vec3 fg = bumpFine(u - S * q.o1, kb);
+  float hb0 = bumpB(Yl), hx = bumpB(Yl + vec2(0.02, 0.0)), hz = bumpB(Yl + vec2(0.0, 0.02));
+  float hb = hb0 + fg.x;
+  vec3 nr = normalize(vec3(-(hx - hb0) / 0.02 * 0.16 + fg.y, 1.0, -(hz - hb0) / 0.02 * 0.16 + fg.z));
   vec3 alb = vec3(0.08, 0.068, 0.06) * (0.6 + 0.8 * tone) * (0.72 + 0.56 * hb);
   float diff = max(dot(nr, L), 0.0);
   float spec = pow(max(dot(nr, normalize(L - rd)), 0.0), 26.0) * 0.24 * mix(1.0, 0.35, smoothstep(0.04, 0.2, pxL));
@@ -899,7 +911,7 @@ void main() {
   // the crust library = the fs script up to its sky section (uniforms, field lookup, warp, plates, bump, ramp)
   const crustLib = src('fs').split('// ---------- sky')[0].replace('out vec4 fragColor;', '');
   const bakeProg = program('#version 300 es\nprecision highp float;\nprecision highp int;\n' + src('common') + crustLib + src('fs-bake'),
-    ['uBOrg', 'uBSize', 'uBRes', 'uBK']);
+    ['uBOrg', 'uBSize', 'uBRes']);
   const fieldProg = program(fragSrc('fs-field'), ['uOrg', 'uSize', 'uRes', 'uTime', 'uPts', 'uAux', 'uCount']);
   const mainProg = program(fragSrc('fs'), ['uRes', 'uTime', 'uCamPos', 'uCamR', 'uCamU', 'uCamF', 'uTanH',
     'uBoatPos', 'uBoatRot', 'uFinPos', 'uUpGlow', 'uField', 'uFieldOrg', 'uFieldSize', 'uSmoke',
@@ -933,8 +945,8 @@ void main() {
 
   // ---------- crust cache: three toroidal layers that follow the camera ----------
   const CRES = 1024;
-  // each layer keeps only the bump octaves its texels can hold (>= ~1.8 texels per noise cell): no baked aliasing
-  const layers = [{ size: 16, ahead: 2, k: [1, 0.6] }, { size: 64, ahead: 14, k: [0, 0] }, { size: 192, ahead: 50, k: [0, 0] }];
+  // layers hold only the coarse relief (period ~0.23 world): >= ~1.8 texels per cycle in every layer, so no baked aliasing
+  const layers = [{ size: 16, ahead: 2 }, { size: 64, ahead: 14 }, { size: 128, ahead: 40 }];
   for (const L of layers) {
     L.tex = [0, 1].map(() => {
       const t = gl.createTexture();
@@ -986,7 +998,6 @@ void main() {
       gl.bindFramebuffer(gl.FRAMEBUFFER, L.fbo);
       gl.uniform2f(bakeProg.U.uBOrg, org[0], org[1]);
       gl.uniform1f(bakeProg.U.uBSize, L.size);
-      gl.uniform2f(bakeProg.U.uBK, L.k[0], L.k[1]);
       if (!L.valid || Math.abs(di[0]) >= CRES || Math.abs(di[1]) >= CRES) {
         gl.scissor(0, 0, CRES, CRES);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
