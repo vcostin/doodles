@@ -639,19 +639,25 @@ vec3 shadeBoat(vec3 pw, vec3 rd, mat3 invR, vec3 L) {
 }
 
 // ---------- crust shading ----------
-// finest cache layer whose window holds w (with a 2-texel margin for filtering)
-bool crustCache(vec2 w, out vec4 A, out vec4 B) {
-  vec2 d0 = w - uCOrg[0], d1 = w - uCOrg[1], d2 = w - uCOrg[2];
-  float m0 = 2.0 * uCSize[0] / 1024.0, m1 = 2.0 * uCSize[1] / 1024.0, m2 = 2.0 * uCSize[2] / 1024.0;
-  if (all(greaterThan(d0, vec2(m0))) && all(lessThan(d0, vec2(uCSize[0] - m0)))) {
-    A = texture(uC0a, w / uCSize[0]); B = texture(uC0b, w / uCSize[0]); return true;
+// The cache layers for this point, chosen by footprint (so fine octaves fade where the live path fades them)
+// and by which window holds the point (2-texel margin). Neighbouring layers crossfade, so there is no line
+// where one hands over to the next.
+bool inLayer(vec2 d, float size) { float m = 2.0 * size / 1024.0; return all(greaterThan(d, vec2(m))) && all(lessThan(d, vec2(size - m))); }
+bool crustCache(vec2 w, float pxL, out vec4 A, out vec4 B) {
+  bool in0 = inLayer(w - uCOrg[0], uCSize[0]), in1 = inLayer(w - uCOrg[1], uCSize[1]), in2 = inLayer(w - uCOrg[2], uCSize[2]);
+  if (in0 && pxL < 0.035) {
+    A = texture(uC0a, w / uCSize[0]); B = texture(uC0b, w / uCSize[0]);
+    float f = smoothstep(0.02, 0.035, pxL);
+    if (in1 && f > 0.0) { A = mix(A, texture(uC1a, w / uCSize[1]), f); B = mix(B, texture(uC1b, w / uCSize[1]), f); }
+    return true;
   }
-  if (all(greaterThan(d1, vec2(m1))) && all(lessThan(d1, vec2(uCSize[1] - m1)))) {
-    A = texture(uC1a, w / uCSize[1]); B = texture(uC1b, w / uCSize[1]); return true;
+  if (in1 && pxL < 0.1) {
+    A = texture(uC1a, w / uCSize[1]); B = texture(uC1b, w / uCSize[1]);
+    float f = smoothstep(0.075, 0.1, pxL);
+    if (in2 && f > 0.0) { A = mix(A, texture(uC2a, w / uCSize[2]), f); B = mix(B, texture(uC2b, w / uCSize[2]), f); }
+    return true;
   }
-  if (all(greaterThan(d2, vec2(m2))) && all(lessThan(d2, vec2(uCSize[2] - m2)))) {
-    A = texture(uC2a, w / uCSize[2]); B = texture(uC2b, w / uCSize[2]); return true;
-  }
+  if (in2) { A = texture(uC2a, w / uCSize[2]); B = texture(uC2b, w / uCSize[2]); return true; }
   return false;
 }
 
@@ -689,7 +695,7 @@ vec3 crustBase(vec3 ro, vec3 rd, float tp, mat3 invR, vec3 L, float pixAng, bool
 
   // resting crust (outside the wake): everything static comes from the baked cache; only lighting is live
   vec4 cA, cB;
-  if (!live && crustCache(P.xz, cA, cB)) {
+  if (!live && crustCache(P.xz, pxL, cA, cB)) {
     float dV = cA.x * 0.5, ws = 0.009 + 0.013 * cA.y, tone = cA.w, hb = cB.x;
     vec2 sl = (cB.yz - 0.5) * 4.0;
     vec3 nr = normalize(vec3(sl.x, 1.0, sl.y));
@@ -927,7 +933,8 @@ void main() {
 
   // ---------- crust cache: three toroidal layers that follow the camera ----------
   const CRES = 1024;
-  const layers = [{ size: 24, ahead: 2, k: [1, 1] }, { size: 96, ahead: 20, k: [1, 0] }, { size: 384, ahead: 100, k: [0, 0] }];
+  // each layer keeps only the bump octaves its texels can hold (>= ~1.8 texels per noise cell): no baked aliasing
+  const layers = [{ size: 16, ahead: 2, k: [1, 0.6] }, { size: 64, ahead: 14, k: [0, 0] }, { size: 192, ahead: 50, k: [0, 0] }];
   for (const L of layers) {
     L.tex = [0, 1].map(() => {
       const t = gl.createTexture();
@@ -947,6 +954,7 @@ void main() {
     L.org = [0, 0]; L.valid = false;
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindTexture(gl.TEXTURE_2D, null);
   const cOrgArr = new Float32Array(6), cSizeArr = new Float32Array(layers.map(L => L.size));
   const imod = (a, n) => ((a % n) + n) % n;
   // bake the texel columns [c0, c0+n) (or rows) of a layer, splitting at the wrap
@@ -967,6 +975,8 @@ void main() {
       const di = [Math.round((org[0] - L.org[0]) / tx), Math.round((org[1] - L.org[1]) / tx)];
       if (L.valid && !di[0] && !di[1]) continue;
       if (!bound) {
+        // unit 0 must not hold a layer texture while baking into it (feedback loop): park the field texture there
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fieldTex);
         gl.useProgram(bakeProg.p);
         gl.uniform1f(bakeProg.U.uBRes, CRES);
         gl.viewport(0, 0, CRES, CRES);
