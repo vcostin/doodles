@@ -876,7 +876,7 @@ void main() {
         if (bergDist(x, y, z) < 0.9) { frac = Math.max(0.22, (i - 1.5) / 24); break; }
       }
     }
-    cam.pull += (frac - cam.pull) * (1 - Math.exp(-dt * (frac < cam.pull ? 14 : 1.2)));   // snap in, ease back out
+    cam.pull += (frac - cam.pull) * (1 - Math.exp(-dt * (frac < cam.pull ? 6 : 1.2)));   // pull in briskly, ease back out
     const pl = cam.pull;
     cam.pos = [boat.x + (want[0] - boat.x) * pl, 1.2 + (want[1] - 1.2) * pl + (1 - pl) * 1.6, boat.z + (want[2] - boat.z) * pl];
     cam.F = norm([cam.fx + sx * LOOK_AHEAD - cam.pos[0], -cam.pos[1], cam.fz + cz * LOOK_AHEAD - cam.pos[2]]);
@@ -1161,13 +1161,16 @@ void main() {
     }
     return d;
   }
-  // keep bow, middle and stern clear of the glass. On contact, commit to sliding one way along the face for
-  // a moment; wedged between two shards (opposing normals) back out along the open side instead.
+  // keep bow, middle and stern clear of the glass.
+  //  - fresh contact: commit to sliding one way along the face; pointer steering pauses briefly (armed once per
+  //    contact, so steering always comes back)
+  //  - a notch (probes disagree, or the contact normal flips between frames) or no progress for 0.6 s:
+  //    back away from the glass on a fixed escape heading for a moment, then try the other side
   const probeDist = (x, z, high) => high ? Math.min(bergDist(x, 0.4, z), bergDist(x, 1.4, z)) : bergDist(x, 0.4, z);
   function collide(dt) {
     let hit = 0, nx = 0, nz = 0;
     const fx = Math.sin(boat.yaw), fz = Math.cos(boat.yaw);
-    for (const [along, clear, high] of [[2.3, 0.3, true], [0.0, 1.0, false], [-1.6, 0.6, false]]) {
+    for (const [along, clear, high] of [[2.3, 0.3, true], [1.2, 0.75, false], [0.0, 1.0, false], [-0.8, 0.9, false], [-1.6, 0.6, false]]) {
       const px = boat.x + fx * along, pz = boat.z + fz * along;
       const d = probeDist(px, pz, high);
       if (d >= clear) continue;
@@ -1178,27 +1181,53 @@ void main() {
       boat.x += gx / gl * (clear - d); boat.z += gz / gl * (clear - d);
       nx += gx / gl; nz += gz / gl; hit++;
     }
-    if (!hit) { if (boat.contactT <= 0) boat.slideSign = 0; return false; }
-    const nl = Math.hypot(nx, nz);
-    let dir;
-    if (hit > 1 && nl < 0.6 * hit) {
-      dir = Math.atan2(-fx, -fz);                         // V-gap: reverse out the way we came
-    } else {
-      nx /= nl || 1; nz /= nl || 1;
-      if (!boat.slideSign) boat.slideSign = (fx * -nz + fz * nx) >= 0 ? 1 : -1;   // the side we were already leaning to
-      const tx = -nz * boat.slideSign, tz = nx * boat.slideSign;
-      dir = Math.atan2(tx + nx * 0.35, tz + nz * 0.35);   // along the face, angled slightly away
+    if (boat.escapeT > 0) boat.escapeT -= dt;
+    if (!hit) {
+      boat.inContact = false; boat.freeT += dt;
+      if (boat.freeT > 0.3) boat.slideSign = 0;
+      return false;
     }
-    boat.yaw = wrapA(boat.yaw + wrapA(dir - boat.yaw) * Math.min(1, dt * 4));
-    boat.yawRate *= Math.exp(-dt * 6);
-    boat.v = Math.max(boat.v * Math.exp(-dt * 0.8), 1.2);
-    boat.contactT = 0.9;
+    const nl = Math.hypot(nx, nz);
+    const ux = nl > 1e-3 ? nx / nl : -fx, uz = nl > 1e-3 ? nz / nl : -fz;
+    if (!boat.inContact && boat.freeT > 0.3) {          // fresh contact
+      boat.contactT = 0.9; boat.cx0 = boat.x; boat.cz0 = boat.z; boat.cT = 0;
+    }
+    boat.cT += dt;
+    const flipped = boat.inContact && ux * boat.lnx + uz * boat.lnz < 0.3;
+    const notch = (hit > 1 && nl < 0.6 * hit) || flipped;
+    let noProgress = false;
+    if (boat.cT > 0.6) {   // sliding window: judge only the last 0.6 s of contact
+      noProgress = Math.hypot(boat.x - boat.cx0, boat.z - boat.cz0) < 0.4;
+      boat.cx0 = boat.x; boat.cz0 = boat.z; boat.cT = 0;
+    }
+    if ((notch || noProgress) && boat.escapeT <= 0) {
+      // back off: away from the glass if the normal is clear, otherwise the way we came
+      boat.escapeDir = nl > 0.6 * hit ? Math.atan2(ux, uz) : Math.atan2(-fx, -fz);
+      boat.escapeT = 0.7;
+      boat.slideSign = boat.slideSign ? -boat.slideSign : 1;
+      boat.cx0 = boat.x; boat.cz0 = boat.z; boat.cT = 0;
+    }
+    // steer for the boat only while escaping or actually heading into the glass; otherwise the pointer is free
+    let dir = null;
+    if (boat.escapeT > 0) dir = boat.escapeDir;
+    else if (fx * ux + fz * uz < 0.1) {
+      if (!boat.slideSign) boat.slideSign = (fx * -uz + fz * ux) >= 0 ? 1 : -1;
+      const tx = -uz * boat.slideSign, tz = ux * boat.slideSign;
+      dir = Math.atan2(tx + ux * 0.35, tz + uz * 0.35);
+    }
+    if (dir !== null) {
+      boat.yaw = wrapA(boat.yaw + wrapA(dir - boat.yaw) * Math.min(1, dt * 4));
+      boat.yawRate *= Math.exp(-dt * 6);
+    }
+    boat.v = boat.contactT > 0 || boat.escapeT > 0 ? Math.max(boat.v * Math.exp(-dt * 0.8), 1.2) : boat.v * Math.exp(-dt * 1.5);
+    boat.inContact = true; boat.freeT = 0; boat.lnx = ux; boat.lnz = uz;
     return true;
   }
 
   // ---------- boat ----------
   const MAXV = 6.2;
-  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.78, scrape: 0, contactT: 0, slideSign: 0 };
+  const boat = { x: 0, z: 0, yaw: 0, v: 0, yawRate: 0, roll: 0, pitch: 0, y: 0.78, scrape: 0, contactT: 0, slideSign: 0,
+                 escapeT: 0, escapeDir: 0, inContact: false, freeT: 1, cT: 0, cx0: 0, cz0: 0, lnx: 0, lnz: 0 };
   window.__magmaBoat = { boat, ptr, cam, bergDist: (x, z) => bergDist(x, 0.3, z) };   // for poking at it from the console
   const FIN_LOCAL = [0, -0.78, -1.21];   // where the swept keel crosses the crust (boat frame, world units)
   let boatRotCols = new Float32Array(9), boatRows = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
@@ -1214,8 +1243,9 @@ void main() {
         throttle = Math.min(1, (dist - 0.9) / 12) * Math.pow(Math.max(0, Math.cos(err)), 1.5);
       }
     }
-    if (boat.contactT > 0) {   // sliding off the glass: hold the committed slide, keep a little way on
-      boat.contactT -= dt; wantRate = 0; throttle = Math.max(throttle, 0.3);
+    if (boat.contactT > 0) boat.contactT -= dt;
+    if (boat.contactT > 0 || boat.escapeT > 0) {   // sliding / backing off the glass: hold course, keep a little way on
+      wantRate = 0; throttle = Math.max(throttle, 0.3);
     }
     boat.yawRate += (wantRate - boat.yawRate) * (1 - Math.exp(-dt * 5));
     boat.yaw = wrapA(boat.yaw + boat.yawRate * dt);
